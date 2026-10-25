@@ -259,6 +259,8 @@ async function onFile(file) {
   try {
     const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
     setBusy("准备图片…");
+    // Re-read the OneDrive settings every time, so folder/card changes apply without restarting the app.
+    await loadSettings().catch(() => {});
     const blob = isPdf ? file : await prepareImage(file);
     const mediaType = isPdf ? "application/pdf" : "image/jpeg";
     setBusy("Claude 正在识别…");
@@ -404,7 +406,8 @@ function renderSettings() {
   const acc = account();
   $("s-account").textContent = acc ? acc.username : "未登录";
   $("s-cards").textContent = cfg
-    ? cfg.cards.map((c) => `****${c.last4} ${c.company} ${c.card} ${c.holder || ""}`).join("\n")
+    ? cfg.cards.map((c) => `****${c.last4} ${c.company} ${c.card} ${c.holder || ""}`).join("\n") +
+      "\n\n" + Object.entries(cfg.companies).map(([k, c]) => `${k} → ${c.root}`).join("\n")
     : "未加载";
 }
 
