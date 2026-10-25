@@ -14,9 +14,15 @@ export function fyStartYear({ y, m }) {
   return m >= 2 ? y : y - 1;
 }
 
-export function yearFolderName(date) {
+// Year folders look like "8 Reciept 01 02 2026 _31 01 2027" (sequence number = start year - 2018).
+export function canonicalYearFolder(date) {
   const s = fyStartYear(date);
-  return `Receipt ${s}_${s + 1}`;
+  return `${s - 2018} Reciept 01 02 ${s} _31 01 ${s + 1}`;
+}
+
+export function matchYearFolder(names, date) {
+  const start = `01 02 ${fyStartYear(date)}`;
+  return names.find((n) => /RECIEPT|RECEIPT/.test(norm(n)) && norm(n).includes(start)) || null;
 }
 
 // VAT quarters: Feb–Apr, May–Jul, Aug–Oct, Nov–Jan.
@@ -97,14 +103,15 @@ export async function planTarget(company, cfg, r, card, listChildren) {
   if (co.layout === "flat") {
     return { folder: [co.root], create: [], register: [co.root, co.register || "Receipt Register.csv"] };
   }
-  const year = yearFolderName(date);
-  const existing = await listChildren([co.root, year]);
+  const yearFound = matchYearFolder(await listChildren([co.root]), date);
+  const year = yearFound || canonicalYearFolder(date);
+  const existing = yearFound ? await listChildren([co.root, year]) : [];
   const found = matchFolder(existing, date, r.isVat, card);
   const sub = found || canonicalFolder(date, r.isVat, card);
   const s = fyStartYear(date);
   return {
     folder: [co.root, year, sub],
-    create: found ? [] : [[co.root, year], [co.root, year, sub]],
+    create: [...(yearFound ? [] : [[co.root, year]]), ...(found ? [] : [[co.root, year, sub]])],
     register: [co.root, year, `Receipt Register ${s}_${s + 1}.csv`],
   };
 }
