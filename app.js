@@ -1,5 +1,6 @@
 import Anthropic from "https://cdn.jsdelivr.net/npm/@anthropic-ai/sdk@0.133.0/+esm";
 import * as L from "./logic.js";
+import { jpegToPdf } from "./pdf.js";
 import { MS_TENANT_ID, MS_CLIENT_ID, SETTINGS_PATH, CLAUDE_MODEL } from "./config.js";
 
 const $ = (id) => document.getElementById(id);
@@ -226,15 +227,17 @@ function blobToBase64(blob) {
   });
 }
 
-// Shrink phone photos: keeps them legible but small enough to upload quickly.
+// Shrink phone photos: 1800px on the long edge is still sharp for receipts and
+// above what Claude reads (it downsizes to ~1568px anyway).
 async function prepareImage(file) {
   const bmp = await createImageBitmap(file, { imageOrientation: "from-image" });
-  const scale = Math.min(1, 2400 / Math.max(bmp.width, bmp.height));
+  const scale = Math.min(1, 1800 / Math.max(bmp.width, bmp.height));
   const c = document.createElement("canvas");
   c.width = Math.round(bmp.width * scale);
   c.height = Math.round(bmp.height * scale);
   c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
-  return new Promise((res) => c.toBlob(res, "image/jpeg", 0.85));
+  const jpeg = await new Promise((res) => c.toBlob(res, "image/jpeg", 0.75));
+  return { jpeg, width: c.width, height: c.height };
 }
 
 // ---------- UI ----------
@@ -262,12 +265,15 @@ async function onFile(file) {
     setBusy("准备图片…");
     // Re-read the OneDrive settings every time, so folder/card changes apply without restarting the app.
     await loadSettings().catch(() => {});
-    const blob = isPdf ? file : await prepareImage(file);
+    // Photos: Claude reads the JPEG; OneDrive gets the same JPEG wrapped in a PDF.
+    const img = isPdf ? null : await prepareImage(file);
+    const readBlob = isPdf ? file : img.jpeg;
     const mediaType = isPdf ? "application/pdf" : "image/jpeg";
     setBusy("Claude 正在识别…");
-    const x = await extract(blob, mediaType);
+    const x = await extract(readBlob, mediaType);
     current = {
-      blob, mediaType, ext: isPdf ? "pdf" : "jpg", sourceName: file.name || "camera.jpg",
+      blob: isPdf ? file : await jpegToPdf(img.jpeg, img.width, img.height),
+      previewBlob: img?.jpeg, mediaType, ext: "pdf", sourceName: file.name || "camera.jpg",
       data: {
         date: x.date, merchant: x.merchant, purpose: x.purpose, property: x.property,
         currency: x.currency || "GBP", total: x.total, vat: x.vat_amount, vatNumber: x.supplier_vat_number,
@@ -304,7 +310,7 @@ function renderReview() {
   prev.innerHTML = "";
   if (current.mediaType.startsWith("image/")) {
     const img = document.createElement("img");
-    img.src = URL.createObjectURL(current.blob);
+    img.src = URL.createObjectURL(current.previewBlob);
     prev.appendChild(img);
   } else {
     prev.textContent = "📄 PDF";
