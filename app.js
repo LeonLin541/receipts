@@ -181,7 +181,8 @@ Rules:
 - supplier_vat_number: the supplier's VAT registration number ("VAT No", "VAT Reg", "GB123456789"). Not company registration numbers.
 - vat_amount: the VAT actually shown (a VAT line, or a VAT breakdown). If the receipt only says prices include VAT without an amount, but shows a rate, compute it from the gross; otherwise 0.
 - property: identify the property only from the receipt itself (delivery address, item text, handwritten note). Code rule: ${cfg?.propertyCodeRule || "house number + street initials"}. Known properties: ${(cfg?.properties || []).join("; ")}.
-- purpose: short and specific, e.g. "repair light", "paint", "business lunch", "parking", "mattress protector".
+- purpose: short and specific, e.g. "repair light", "paint", "parking", "mattress protector".
+- Food and drink (restaurants, cafes, coffee, McDonald's, takeaway, snacks, supermarket meal deals) always get exactly one of these purposes: "Working Lunch" if the transaction time is before 17:00 or not shown, "Working Dinner" if 17:00 or later. Never describe the food itself.
 - notes: write in Simplified Chinese, only for things Leon should double-check.`;
 }
 
@@ -418,6 +419,9 @@ async function main() {
   $("f-isvat").addEventListener("change", () => updatePlan());
   for (const b of document.querySelectorAll("[data-company]")) {
     b.addEventListener("click", () => { current.manual = b.dataset.company; updatePlan(); });
+  }
+  for (const b of document.querySelectorAll("[data-purpose]")) {
+    b.addEventListener("click", () => { $("f-purpose").value = b.dataset.purpose; updatePlan(); });
   }
   $("confirm").addEventListener("click", confirmFile);
   $("cancel").addEventListener("click", () => show("home"));

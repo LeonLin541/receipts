@@ -74,7 +74,7 @@ const clean = (s) =>
 export function buildFileName(r, ext) {
   const d = parseISO(r.date);
   const parts = [r.merchant, r.purpose, r.property].map(clean).filter(Boolean);
-  const amount = `${r.currency || "GBP"} ${Number(r.total).toFixed(2)}`;
+  const amount = `${r.currency || "GBP"} ${Number(r.total).toFixed(2)}, VAT ${Number(r.vat || 0).toFixed(2)}`;
   return `${d.y} ${pad(d.m)} ${pad(d.d)} ${r.company}, ${parts.join(", ")}, ${amount}.${ext}`;
 }
 

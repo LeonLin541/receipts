@@ -43,6 +43,8 @@
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
   .seg button.on { background: var(--brand); color: var(--brand-ink); font-weight: 600; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .chips button { padding: 6px 12px; font-size: 14px; border-radius: 999px; }
   .check { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--ink); font-size: 15px; }
   .check input { width: 20px; height: 20px; }
   #preview { max-height: 240px; overflow: hidden; border-radius: 10px; margin-bottom: 8px; text-align: center; color: var(--muted); }
@@ -107,6 +109,11 @@
       </div>
       <label for="f-merchant">商家</label><input id="f-merchant" type="text">
       <label for="f-purpose">用途</label><input id="f-purpose" type="text">
+      <div class="chips">
+        <button type="button" data-purpose="Lunch">Lunch</button>
+        <button type="button" data-purpose="Working Lunch">Working Lunch</button>
+        <button type="button" data-purpose="Working Dinner">Working Dinner</button>
+      </div>
       <label for="f-property">物业（可空）</label><input id="f-property" type="text" placeholder="76CHL / 19FG / R4-37CR">
       <div class="row">
         <div><label for="f-total">总额 £</label><input id="f-total" type="number" step="0.01" inputmode="decimal"></div>
