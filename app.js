@@ -241,10 +241,14 @@ async function prepareImage(file) {
 }
 
 // ---------- UI ----------
-let current = null; // { blob, ext, mediaType, sourceName, data, company, manual }
+// One item per receipt. status: reading | ready | check | filing | filed | error
+let queue = [];
+let current = null; // the item open in the review form
+let batchMode = false;
+let nextId = 1;
 
 function show(view) {
-  for (const v of ["home", "busy", "review", "done", "settings"]) $(v).hidden = v !== view;
+  for (const v of ["home", "busy", "review", "done", "batch", "settings"]) $(v).hidden = v !== view;
 }
 
 function setBusy(text) { $("busy-text").textContent = text; show("busy"); }
@@ -258,36 +262,87 @@ function toast(text, isError) {
   toast.timer = setTimeout(() => (t.hidden = true), isError ? 8000 : 3500);
 }
 
-async function onFile(file) {
-  if (!file) return;
+const isPdfFile = (f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name);
+
+// Read one file with Claude and turn it into a queue item.
+async function analyse(item) {
+  const { file } = item;
+  const isPdf = isPdfFile(file);
+  // Photos: Claude reads the JPEG; OneDrive gets the same JPEG wrapped in a PDF.
+  const img = isPdf ? null : await prepareImage(file);
+  item.mediaType = isPdf ? "application/pdf" : "image/jpeg";
+  item.previewBlob = img?.jpeg;
+  const x = await extract(isPdf ? file : img.jpeg, item.mediaType);
+  item.blob = isPdf ? file : await jpegToPdf(img.jpeg, img.width, img.height);
+  item.ext = "pdf";
+  item.sourceName = file.name || "camera.jpg";
+  item.data = {
+    date: x.date, merchant: x.merchant, purpose: x.purpose, property: x.property,
+    currency: x.currency || "GBP", total: x.total, vat: x.vat_amount, vatNumber: x.supplier_vat_number,
+    cardLast4: x.card_last4, isVat: Boolean(x.supplier_vat_number) && x.vat_amount > 0,
+  };
+  item.notes = [
+    !x.is_receipt && "这看起来不是收据/发票。",
+    x.multiple_receipts && "图里好像有多张收据，建议分开拍。",
+    x.notes,
+  ].filter(Boolean).join(" ");
+  item.manual = null;
+}
+
+// Work out company, card, file name, target folder and duplicate flags for an item.
+async function planItem(item) {
+  const d = item.data;
+  const { company, card, known } = L.resolveCard(cfg.cards, d.cardLast4, item.manual);
+  Object.assign(item, { company, card, known, plan: null, name: null, dup: false });
+  if (!company || !L.parseISO(d.date) || !(d.total > 0)) return;
+  d.company = company;
+  item.name = L.buildFileName(d, item.ext);
+  item.plan = await L.planTarget(company, cfg, d, card, listChildren);
+  const reg = await readText(item.plan.register).catch(() => null);
+  const sameInBatch = queue.some((o) => o !== item && o.data && o.status !== "error" &&
+    o.data.date === d.date && Number(o.data.total) === Number(d.total) && o.company === company);
+  item.dup = Boolean((reg && L.findDuplicate(reg, d)) || sameInBatch);
+}
+
+// "ready" = nothing for Leon to check: known company card, date + amount read, no notes, no duplicate.
+function judge(item) {
+  item.status = item.plan && item.known && !item.manual && !item.notes && !item.dup ? "ready" : "check";
+}
+
+async function fileItem(item) {
+  const { plan, name, data: d } = item;
+  for (const segs of plan.create) await ensureFolder(segs);
+  const saved = await uploadUnique(plan.folder, name, item.blob);
+  const relPath = [...plan.folder.slice(1), saved].join("/");
+  const row = L.registerRow(d, item.card, relPath, item.sourceName);
+  let regNote = "";
   try {
-    const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+    await flushPendingRows();
+    await appendRegister(plan.register, row);
+  } catch {
+    store.set("pendingRows", [...store.get("pendingRows", []), { reg: plan.register, row }]);
+    regNote = "（登记表暂时写不进去，下次自动补写）";
+  }
+  const hist = store.get("history", []);
+  hist.unshift({ name: saved, folder: plan.folder.join(" / "), at: new Date().toISOString() });
+  store.set("history", hist.slice(0, 30));
+  Object.assign(item, { status: "filed", saved, regNote });
+  childCache.clear();
+}
+
+// ----- single photo -----
+async function onSingle(file) {
+  if (!file) return;
+  batchMode = false;
+  const item = { id: nextId++, file, status: "reading" };
+  queue = [item];
+  try {
     setBusy("准备图片…");
     // Re-read the OneDrive settings every time, so folder/card changes apply without restarting the app.
     await loadSettings().catch(() => {});
-    // Photos: Claude reads the JPEG; OneDrive gets the same JPEG wrapped in a PDF.
-    const img = isPdf ? null : await prepareImage(file);
-    const readBlob = isPdf ? file : img.jpeg;
-    const mediaType = isPdf ? "application/pdf" : "image/jpeg";
     setBusy("Claude 正在识别…");
-    const x = await extract(readBlob, mediaType);
-    current = {
-      blob: isPdf ? file : await jpegToPdf(img.jpeg, img.width, img.height),
-      previewBlob: img?.jpeg, mediaType, ext: "pdf", sourceName: file.name || "camera.jpg",
-      data: {
-        date: x.date, merchant: x.merchant, purpose: x.purpose, property: x.property,
-        currency: x.currency || "GBP", total: x.total, vat: x.vat_amount, vatNumber: x.supplier_vat_number,
-        cardLast4: x.card_last4, isVat: Boolean(x.supplier_vat_number) && x.vat_amount > 0,
-      },
-      notes: [
-        !x.is_receipt && "这看起来不是收据/发票。",
-        x.multiple_receipts && "图里好像有多张收据，建议分开拍。",
-        x.notes,
-      ].filter(Boolean).join(" "),
-      manual: null,
-    };
-    renderReview();
-    show("review");
+    await analyse(item);
+    openReview(item);
   } catch (e) {
     console.error(e);
     show("home");
@@ -295,26 +350,137 @@ async function onFile(file) {
   }
 }
 
+// ----- batch -----
+async function onMany(files) {
+  if (!files.length) return;
+  if (files.length === 1 && !batchMode) return onSingle(files[0]);
+  if (!batchMode) queue = [];
+  batchMode = true;
+  await loadSettings().catch(() => {});
+  const items = files.map((file) => ({ id: nextId++, file, status: "reading" }));
+  queue.push(...items);
+  renderBatch();
+  show("batch");
+  // Three at a time: quick, and gentle on API rate limits.
+  let i = 0;
+  const worker = async () => {
+    while (i < items.length) {
+      const item = items[i++];
+      try {
+        await analyse(item);
+        await planItem(item);
+        judge(item);
+      } catch (e) {
+        console.error(e);
+        Object.assign(item, { status: "error", error: e.message || String(e) });
+      }
+      renderBatch();
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+}
+
+const STATUS = {
+  reading: "识别中…", ready: "✓ 可直接归档", check: "⚠ 需要确认", filing: "归档中…", filed: "已归档", error: "出错",
+};
+
+function issueText(item) {
+  if (item.status === "error") return item.error;
+  if (item.status !== "check") return "";
+  const d = item.data;
+  if (!item.company) return `卡号 ${d.cardLast4 ? "****" + d.cardLast4 : "没看到"}，请选公司`;
+  if (!item.plan) return "日期或金额没读到";
+  if (item.dup) return "可能重复";
+  if (!item.known) return "非公司卡 → OTHER CARD";
+  return item.notes || "请看一下";
+}
+
+function renderBatch() {
+  const ul = $("batch-list");
+  ul.innerHTML = "";
+  for (const item of queue) {
+    const li = document.createElement("li");
+    li.className = `bitem s-${item.status}`;
+    const thumb = document.createElement("div");
+    thumb.className = "thumb";
+    if (item.previewBlob) {
+      const img = document.createElement("img");
+      img.src = item.thumbUrl ||= URL.createObjectURL(item.previewBlob);
+      thumb.appendChild(img);
+    } else thumb.textContent = item.status === "reading" ? "…" : "📄";
+    const text = document.createElement("div");
+    text.className = "btext";
+    const title = document.createElement("div");
+    title.className = "bname";
+    const d = item.data;
+    title.textContent = item.saved || item.name ||
+      (d ? [d.date, d.merchant, d.total ? `GBP ${Number(d.total).toFixed(2)}` : ""].filter(Boolean).join(" · ") : "") ||
+      item.file.name || "收据";
+    const sub = document.createElement("div");
+    sub.className = "bsub";
+    sub.textContent = [STATUS[item.status], issueText(item)].filter(Boolean).join(" · ");
+    text.append(title, sub);
+    li.append(thumb, text);
+    if (["ready", "check"].includes(item.status)) {
+      li.addEventListener("click", () => openReview(item));
+      const x = document.createElement("button");
+      x.className = "ghost bx";
+      x.textContent = "✕";
+      x.setAttribute("aria-label", "移除");
+      x.addEventListener("click", (e) => { e.stopPropagation(); queue = queue.filter((o) => o !== item); renderBatch(); });
+      li.appendChild(x);
+    }
+    ul.appendChild(li);
+  }
+  const counts = (s) => queue.filter((i) => i.status === s).length;
+  const ready = counts("ready");
+  $("batch-title").textContent =
+    `共 ${queue.length} 张 · 已归档 ${counts("filed")} · 待确认 ${counts("check")}` +
+    (counts("reading") ? ` · 识别中 ${counts("reading")}` : "");
+  $("batch-file").textContent = ready ? `归档 ${ready} 张可直接归档的` : "没有可直接归档的";
+  $("batch-file").disabled = !ready;
+}
+
+async function fileAllReady() {
+  for (const item of queue.filter((i) => i.status === "ready")) {
+    item.status = "filing";
+    renderBatch();
+    try {
+      await fileItem(item);
+    } catch (e) {
+      Object.assign(item, { status: "check", notes: `上传失败：${e.message}` });
+    }
+    renderBatch();
+  }
+  renderHistory();
+  const left = queue.filter((i) => i.status === "check").length;
+  toast(left ? `已归档，还有 ${left} 张需要你确认` : "全部归档完成");
+}
+
+// ----- review form -----
 const FIELDS = [
   ["date", "f-date"], ["merchant", "f-merchant"], ["purpose", "f-purpose"], ["property", "f-property"],
   ["total", "f-total"], ["vat", "f-vat"], ["vatNumber", "f-vatno"], ["cardLast4", "f-card"],
 ];
 
-function renderReview() {
-  const d = current.data;
+function openReview(item) {
+  current = item;
+  const d = item.data;
   for (const [k, id] of FIELDS) $(id).value = d[k] ?? "";
   $("f-isvat").checked = d.isVat;
-  $("notes").textContent = current.notes;
-  $("notes").hidden = !current.notes;
+  $("notes").textContent = item.notes;
+  $("notes").hidden = !item.notes;
   const prev = $("preview");
   prev.innerHTML = "";
-  if (current.mediaType.startsWith("image/")) {
+  if (item.previewBlob) {
     const img = document.createElement("img");
-    img.src = URL.createObjectURL(current.previewBlob);
+    img.src = item.thumbUrl ||= URL.createObjectURL(item.previewBlob);
     prev.appendChild(img);
   } else {
     prev.textContent = "📄 PDF";
   }
+  $("cancel").textContent = batchMode ? "返回列表" : "取消";
+  show("review");
   updatePlan();
 }
 
@@ -329,71 +495,63 @@ function readForm() {
 let planSeq = 0;
 async function updatePlan() {
   readForm();
-  const d = current.data;
-  const { company, card, known } = L.resolveCard(cfg.cards, d.cardLast4, current.manual);
-  current.company = company;
-  current.card = card;
+  const item = current;
+  const d = item.data;
+  const seq = ++planSeq;
+  const { company, known } = L.resolveCard(cfg.cards, d.cardLast4, item.manual);
   for (const b of document.querySelectorAll("[data-company]")) b.classList.toggle("on", b.dataset.company === company);
   const warn = $("card-warn");
-  warn.hidden = known;
+  warn.hidden = known || (company && item.manual && known);
   warn.textContent = !company
     ? `卡号 ${d.cardLast4 ? "****" + d.cardLast4 : "（没看到）"} 不是已登记的卡 —— 请选择公司`
     : `非公司卡（${d.cardLast4 ? "****" + d.cardLast4 : "没有卡号"}）→ 放进 OTHER CARD，标记需报销`;
-  if (company && current.manual && known) warn.hidden = true;
-
-  const ok = company && L.parseISO(d.date) && d.total > 0;
-  $("confirm").disabled = !ok;
-  if (!ok) { $("plan").textContent = company ? "请补全日期和金额" : "选择公司后显示归档位置"; return; }
-  d.company = company;
-  const seq = ++planSeq;
-  const name = L.buildFileName(d, current.ext);
-  $("plan").textContent = `${name}\n→ …`;
+  $("confirm").disabled = true;
+  $("dup-warn").hidden = true;
+  $("plan").textContent = company ? "…" : "选择公司后显示归档位置";
   try {
-    const plan = await L.planTarget(company, cfg, d, card, listChildren);
+    await planItem(item);
     if (seq !== planSeq) return;
-    current.plan = plan;
-    current.name = name;
-    $("plan").textContent = `${name}\n→ ${plan.folder.join(" / ")}${plan.create.length ? "（新建）" : ""}`;
-    const reg = await readText(plan.register).catch(() => null);
-    if (seq !== planSeq) return;
-    const dup = reg && L.findDuplicate(reg, d);
-    $("dup-warn").hidden = !dup;
+    if (!item.plan) { $("plan").textContent = company ? "请补全日期和金额" : "选择公司后显示归档位置"; return; }
+    $("plan").textContent = `${item.name}\n→ ${item.plan.folder.join(" / ")}${item.plan.create.length ? "（新建）" : ""}`;
+    $("dup-warn").hidden = !item.dup;
+    $("confirm").disabled = false;
   } catch (e) {
-    $("plan").textContent = e.message;
+    if (seq === planSeq) $("plan").textContent = e.message;
   }
 }
 
 async function confirmFile() {
   readForm();
   await updatePlan();
-  const { plan, name, data: d } = current;
-  if (!plan) return;
+  const item = current;
+  if (!item.plan) return;
   try {
     setBusy("存入 OneDrive…");
-    for (const segs of plan.create) await ensureFolder(segs);
-    const saved = await uploadUnique(plan.folder, name, current.blob);
-    const relPath = [...plan.folder.slice(1), saved].join("/");
-    const row = L.registerRow(d, current.card, relPath, current.sourceName);
-    let regNote = "";
-    try {
-      await flushPendingRows();
-      await appendRegister(plan.register, row);
-    } catch (e) {
-      store.set("pendingRows", [...store.get("pendingRows", []), { reg: plan.register, row }]);
-      regNote = "（登记表暂时写不进去，下次自动补写）";
-    }
-    const hist = store.get("history", []);
-    hist.unshift({ name: saved, folder: plan.folder.join(" / "), at: new Date().toISOString() });
-    store.set("history", hist.slice(0, 30));
-    $("done-name").textContent = saved;
-    $("done-folder").textContent = plan.folder.join(" / ") + regNote;
+    await fileItem(item);
     renderHistory();
-    show("done");
+    if (batchMode) {
+      renderBatch();
+      show("batch");
+      toast(`已归档：${item.saved}`);
+    } else {
+      $("done-name").textContent = item.saved;
+      $("done-folder").textContent = item.plan.folder.join(" / ") + item.regNote;
+      show("done");
+    }
   } catch (e) {
     console.error(e);
     show("review");
     toast(e.message, true);
   }
+}
+
+function leaveReview() {
+  if (batchMode) {
+    // Keep any edits; the item now needs a look rather than auto-filing.
+    if (current.status === "ready") current.status = "check";
+    renderBatch();
+    show("batch");
+  } else show("home");
 }
 
 function renderHistory() {
@@ -418,9 +576,20 @@ function renderSettings() {
     : "未加载";
 }
 
+function closeBatch() {
+  const open = queue.filter((i) => ["reading", "ready", "check", "filing"].includes(i.status)).length;
+  if (open && !confirm(`还有 ${open} 张没归档，确定离开？（没归档的会被丢弃）`)) return;
+  queue = [];
+  batchMode = false;
+  show("home");
+}
+
 async function main() {
-  $("cam").addEventListener("change", (e) => { onFile(e.target.files[0]); e.target.value = ""; });
-  $("pick").addEventListener("change", (e) => { onFile(e.target.files[0]); e.target.value = ""; });
+  $("cam").addEventListener("change", (e) => { onSingle(e.target.files[0]); e.target.value = ""; });
+  $("pick").addEventListener("change", (e) => { onMany([...e.target.files]); e.target.value = ""; });
+  $("batch-add").addEventListener("change", (e) => { onMany([...e.target.files]); e.target.value = ""; });
+  $("batch-file").addEventListener("click", fileAllReady);
+  $("batch-close").addEventListener("click", closeBatch);
   for (const [, id] of FIELDS) $(id).addEventListener("input", () => updatePlan());
   $("f-isvat").addEventListener("change", () => updatePlan());
   for (const b of document.querySelectorAll("[data-company]")) {
@@ -430,10 +599,10 @@ async function main() {
     b.addEventListener("click", () => { $("f-purpose").value = b.dataset.purpose; updatePlan(); });
   }
   $("confirm").addEventListener("click", confirmFile);
-  $("cancel").addEventListener("click", () => show("home"));
+  $("cancel").addEventListener("click", leaveReview);
   $("again").addEventListener("click", () => show("home"));
   $("open-settings").addEventListener("click", () => { renderSettings(); show("settings"); });
-  $("close-settings").addEventListener("click", () => show("home"));
+  $("close-settings").addEventListener("click", () => show(batchMode ? "batch" : "home"));
   $("s-save").addEventListener("click", () => { store.set("claudeKey", $("s-key").value.trim()); toast("已保存"); show("home"); });
   $("s-reload").addEventListener("click", async () => {
     try { await loadSettings(); renderSettings(); toast("设置已更新"); } catch (e) { toast(e.message, true); }
