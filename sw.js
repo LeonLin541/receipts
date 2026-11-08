@@ -1,6 +1,6 @@
 // Network-first for the app's own files, so updates show up on the next open;
 // falls back to cache when offline. Cross-origin requests (Graph, Claude, CDN) are not touched.
-const CACHE = "receipts-v5";
+const CACHE = "receipts-v6";
 const SHELL = ["./", "index.html", "app.js", "logic.js", "pdf.js", "config.js", "manifest.webmanifest", "icon-192.png"];
 
 self.addEventListener("install", (e) => {

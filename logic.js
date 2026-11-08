@@ -104,6 +104,7 @@ export async function planTarget(company, cfg, r, card, listChildren) {
   if (co.layout === "flat") {
     return { folder: [co.root], create: [], register: [co.root, co.register || "Receipt Register.csv"] };
   }
+  if (co.layout === "pu") return planPU(co, date, card, listChildren);
   const yearFound = matchYearFolder(await listChildren([co.root]), date);
   const year = yearFound || canonicalYearFolder(date);
   const existing = yearFound ? await listChildren([co.root, year]) : [];
@@ -115,6 +116,89 @@ export async function planTarget(company, cfg, r, card, listChildren) {
     create: [...(yearFound ? [] : [[co.root, year]]), ...(found ? [] : [[co.root, year, sub]])],
     register: [co.root, year, `Receipt Register ${s}_${s + 1}.csv`],
   };
+}
+
+// ----- PropUnited: one folder per company year, no VAT/card split, personal/cash in a subfolder,
+// and every receipt logged in the Excel ledgers instead of a CSV register.
+
+// Company year starts on `fyStart` ("MM-DD", e.g. "10-15" = 15 Oct).
+export function fyStartYearOn({ y, m, d }, fyStart) {
+  const [sm, sd] = fyStart.split("-").map(Number);
+  return m > sm || (m === sm && d >= sd) ? y : y - 1;
+}
+
+// "01 reciept 2025 10 15_2026 10 14" (number = years since the first year).
+export function puYearFolder(date, co) {
+  const s = fyStartYearOn(date, co.fyStart);
+  const [sm, sd] = co.fyStart.split("-").map(Number);
+  const end = new Date(Date.UTC(s + 1, sm - 1, sd - 1));
+  const n = s - co.firstYear + 1;
+  return `${pad(n)} reciept ${s} ${pad(sm)} ${pad(sd)}_${end.getUTCFullYear()} ${pad(end.getUTCMonth() + 1)} ${pad(end.getUTCDate())}`;
+}
+
+export function matchPuYearFolder(names, date, co) {
+  const s = fyStartYearOn(date, co.fyStart);
+  const [sm, sd] = co.fyStart.split("-").map(Number);
+  const start = `${s} ${pad(sm)} ${pad(sd)}`;
+  return names.find((n) => /RECIEPT|RECEIPT/.test(norm(n)) && norm(n).includes(start)) || null;
+}
+
+async function planPU(co, date, card, listChildren) {
+  const yearFound = matchPuYearFolder(await listChildren([co.root]), date, co);
+  const year = yearFound || puYearFolder(date, co);
+  const personal = card === "OTHER";
+  const folder = personal ? [co.root, year, co.personalFolder] : [co.root, year];
+  const subExists = personal && yearFound && (await listChildren([co.root, year])).includes(co.personalFolder);
+  return {
+    folder,
+    create: [...(yearFound ? [] : [[co.root, year]]), ...(personal && !subExists ? [folder] : [])],
+    register: null,
+    ledger: personal ? { kind: "expense", ...co.expenses } : { kind: "bank", ...co.ledger },
+  };
+}
+
+// Excel stores dates as days since 1899-12-30.
+export function excelSerial(iso) {
+  const { y, m, d } = parseISO(iso);
+  return (Date.UTC(y, m - 1, d) - Date.UTC(1899, 11, 30)) / 86400000;
+}
+
+export const ukDate = (iso) => { const { y, m, d } = parseISO(iso); return `${pad(d)}/${pad(m)}/${y}`; };
+
+// Values for one ledger row. Bank sheet: columns D..P; Expense Claims sheet: C..H (+ J).
+export function ledgerCells(kind, r) {
+  const total = Number(Number(r.total).toFixed(2));
+  const explanation = [r.purpose, r.property].filter(Boolean).join(" · ");
+  if (kind === "bank") {
+    //       D Description, E Paid Out, F In, G Bal, H, I Explanation, J, K Receipt, L Filing, M, N Net, O VAT, P Gross
+    return { first: "D", last: "P", values: [r.merchant, total, "", "", "", explanation, "", "Y", "", "", "", "", total] };
+  }
+  //       C Supplier, D Description, E Net, F VAT, G Total, H Receipt
+  return { first: "C", last: "H", values: [r.merchant, explanation, total, "", total, "Y"], reimbursed: "N" };
+}
+
+// Ledger duplicate: a row with the same date (shown as dd/mm/yyyy) and the same amount.
+// `text` is usedRange text (2D, starting at A1); amount column E (bank) or G (expense).
+export function ledgerHasDup(text, kind, r) {
+  const want = ukDate(r.date);
+  const amountCol = kind === "bank" ? 4 : 6;
+  const total = Number(r.total).toFixed(2);
+  return text.some((row) => (row[1] || "").trim() === want && Number(String(row[amountCol]).replace(/[£,]/g, "")).toFixed(2) === total);
+}
+
+// Next free row: bank sheet = after the last row with anything in B..P (data starts at row 15);
+// Expense Claims = first row 17..51 with no date, supplier or total (EX numbers are pre-filled in I).
+export function nextLedgerRow(text, kind) {
+  if (kind === "bank") {
+    let last = 14;
+    text.forEach((row, i) => { if (i >= 14 && row.slice(1, 16).some((c) => String(c).trim())) last = i + 1; });
+    return last + 1;
+  }
+  for (let r = 17; r <= 51; r++) {
+    const row = text[r - 1] || [];
+    if (![row[1], row[2], row[6]].some((c) => String(c ?? "").trim())) return r;
+  }
+  return null;
 }
 
 export const REGISTER_HEADER = [
