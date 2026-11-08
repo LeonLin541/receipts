@@ -177,13 +177,20 @@ export function ledgerCells(kind, r) {
   return { first: "C", last: "H", values: [r.merchant, explanation, total, "", total, "Y"], reimbursed: "N" };
 }
 
-// Ledger duplicate: a row with the same date (shown as dd/mm/yyyy) and the same amount.
-// `text` is usedRange text (2D, starting at A1); amount column E (bank) or G (expense).
-export function ledgerHasDup(text, kind, r) {
-  const want = ukDate(r.date);
+// Ledger duplicate: a row with the same date and the same amount.
+// `values` is usedRange values (2D, starting at A1). Real dates come back as Excel serial numbers
+// (Excel Online's *text* is US-formatted, so don't compare text); dates typed as text are dd/mm/yyyy.
+// Amount column E (bank) or G (expense).
+export function ledgerHasDup(values, kind, r) {
+  const serial = excelSerial(r.date);
+  const uk = ukDate(r.date);
   const amountCol = kind === "bank" ? 4 : 6;
   const total = Number(r.total).toFixed(2);
-  return text.some((row) => (row[1] || "").trim() === want && Number(String(row[amountCol]).replace(/[£,]/g, "")).toFixed(2) === total);
+  return values.some((row) => {
+    const d = row[1];
+    const sameDate = d === serial || (typeof d === "string" && d.trim() === uk);
+    return sameDate && Number(String(row[amountCol] ?? "").replace(/[£,]/g, "")).toFixed(2) === total;
+  });
 }
 
 // Next free row: bank sheet = after the last row with anything in B..P (data starts at row 15);

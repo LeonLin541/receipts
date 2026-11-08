@@ -160,22 +160,32 @@ async function appendRegister(drv, regSegs, row) {
 }
 
 // ---------- Excel ledgers (PropUnited bank sheet / Expense Claims) ----------
-const sheetUrl = (drv, spec) =>
-  `${itemUrl(drv, spec.path.split("/"))}/workbook/worksheets/${encodeURIComponent(spec.sheet)}`;
+// The workbook API must be reached by item id: path-addressed workbook calls fail
+// ("Could not obtain a WAC access token") for these SharePoint paths with Chinese folder names.
+const itemIds = new Map();
+async function sheetUrl(drv, spec) {
+  const key = `${drv.key}:${spec.path}`;
+  if (!itemIds.has(key)) {
+    const res = await g(drv, `${itemUrl(drv, spec.path.split("/"))}?$select=id`);
+    if (!res.ok) throw await gError(res, `找不到 ${spec.path.split("/").pop()}`);
+    itemIds.set(key, (await res.json()).id);
+  }
+  return `${drv.base}/items/${itemIds.get(key)}/workbook/worksheets/${encodeURIComponent(spec.sheet)}`;
+}
 
-// Displayed text of the used range, padded so that text[0] is row 1 and text[r][0] is column A.
-async function sheetText(drv, spec) {
-  const res = await g(drv, `${sheetUrl(drv, spec)}/usedRange(valuesOnly=true)?$select=address,text`);
+// Used range as {text, values}, padded so that [0] is row 1 and [r][0] is column A.
+async function sheetGrid(drv, spec) {
+  const res = await g(drv, `${await sheetUrl(drv, spec)}/usedRange(valuesOnly=true)?$select=address,text,values`);
   if (!res.ok) throw await gError(res, `读取 ${spec.sheet}`);
-  const { address, text } = await res.json();
+  const { address, text, values } = await res.json();
   const m = /!\$?([A-Z]+)\$?(\d+)/.exec(address);
   const col0 = m[1].split("").reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
-  const rows = Array.from({ length: +m[2] - 1 }, () => []);
-  return rows.concat(text.map((r) => [...Array(col0).fill(""), ...r]));
+  const pad = (grid) => Array.from({ length: +m[2] - 1 }, () => []).concat(grid.map((r) => [...Array(col0).fill(""), ...r]));
+  return { text: pad(text), values: pad(values) };
 }
 
 async function patchRange(drv, spec, address, body) {
-  const res = await g(drv, `${sheetUrl(drv, spec)}/range(address='${address}')`, {
+  const res = await g(drv, `${await sheetUrl(drv, spec)}/range(address='${address}')`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -184,7 +194,7 @@ async function patchRange(drv, spec, address, body) {
 }
 
 async function appendLedger(drv, spec, d) {
-  const text = await sheetText(drv, spec);
+  const { text } = await sheetGrid(drv, spec);
   const row = L.nextLedgerRow(text, spec.kind);
   if (!row) throw new Error(`${spec.sheet} 表已经填满（第 17–51 行），请在表里加行`);
   const cells = L.ledgerCells(spec.kind, d);
@@ -379,8 +389,8 @@ async function planItem(item) {
     const reg = await readText(drv, item.plan.register).catch(() => null);
     dupSaved = Boolean(reg && L.findDuplicate(reg, d));
   } else {
-    const text = await sheetText(drv, item.plan.ledger).catch(() => null);
-    dupSaved = Boolean(text && L.ledgerHasDup(text, item.plan.ledger.kind, d));
+    const grid = await sheetGrid(drv, item.plan.ledger).catch(() => null);
+    dupSaved = Boolean(grid && L.ledgerHasDup(grid.values, item.plan.ledger.kind, d));
   }
   const sameInBatch = queue.some((o) => o !== item && o.data && o.status !== "error" &&
     o.data.date === d.date && Number(o.data.total) === Number(d.total) && o.company === company);
