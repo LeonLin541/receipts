@@ -306,7 +306,7 @@ async function planItem(item) {
 
 // "ready" = nothing for Leon to check: known company card, date + amount read, no notes, no duplicate.
 function judge(item) {
-  item.status = item.plan && item.known && !item.manual && !item.notes && !item.dup ? "ready" : "check";
+  item.status = item.confirmed || (item.plan && item.known && !item.manual && !item.notes && !item.dup) ? "ready" : "check";
 }
 
 async function fileItem(item) {
@@ -381,7 +381,7 @@ async function onMany(files) {
 }
 
 const STATUS = {
-  reading: "识别中…", ready: "✓ 可直接归档", check: "⚠ 需要确认", filing: "归档中…", filed: "已归档", error: "出错",
+  reading: "识别中…", ready: "✓ 可归档", check: "⚠ 需要确认", filing: "归档中…", filed: "已归档", error: "出错",
 };
 
 function issueText(item) {
@@ -395,75 +395,130 @@ function issueText(item) {
   return item.notes || "请看一下";
 }
 
+// The list is keyed by item id and updated in place, so the edit form that is open
+// inside one row keeps its focus while other receipts finish reading.
+const rows = new Map();
+let openId = null;
+
+function rowFor(item) {
+  let r = rows.get(item.id);
+  if (r) return r;
+  const li = document.createElement("li");
+  const head = document.createElement("div");
+  head.className = "bhead";
+  const thumb = document.createElement("div");
+  thumb.className = "thumb";
+  const text = document.createElement("div");
+  text.className = "btext";
+  const title = document.createElement("div");
+  title.className = "bname";
+  const sub = document.createElement("div");
+  sub.className = "bsub";
+  text.append(title, sub);
+  const x = document.createElement("button");
+  x.className = "ghost bx";
+  x.textContent = "✕";
+  x.setAttribute("aria-label", "移除");
+  x.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (openId === item.id) collapse();
+    queue = queue.filter((o) => o !== item);
+    renderBatch();
+  });
+  head.append(thumb, text, x);
+  head.addEventListener("click", () => {
+    if (!["ready", "check"].includes(item.status)) return;
+    if (openId === item.id) collapse(); else expand(item);
+  });
+  li.appendChild(head);
+  r = { li, thumb, title, sub, x };
+  rows.set(item.id, r);
+  return r;
+}
+
 function renderBatch() {
   const ul = $("batch-list");
-  ul.innerHTML = "";
-  for (const item of queue) {
-    const li = document.createElement("li");
-    li.className = `bitem s-${item.status}`;
-    const thumb = document.createElement("div");
-    thumb.className = "thumb";
-    if (item.previewBlob) {
+  for (const [id, r] of rows) {
+    if (!queue.some((i) => i.id === id)) { r.li.remove(); rows.delete(id); }
+  }
+  queue.forEach((item, idx) => {
+    const r = rowFor(item);
+    r.li.className = `bitem s-${item.status}${openId === item.id ? " open" : ""}`;
+    if (item.previewBlob && !r.thumb.firstChild?.src) {
+      r.thumb.textContent = "";
       const img = document.createElement("img");
       img.src = item.thumbUrl ||= URL.createObjectURL(item.previewBlob);
-      thumb.appendChild(img);
-    } else thumb.textContent = item.status === "reading" ? "…" : "📄";
-    const text = document.createElement("div");
-    text.className = "btext";
-    const title = document.createElement("div");
-    title.className = "bname";
+      r.thumb.appendChild(img);
+    } else if (!item.previewBlob) r.thumb.textContent = item.status === "reading" ? "…" : "📄";
     const d = item.data;
-    title.textContent = item.saved || item.name ||
+    r.title.textContent = item.saved || item.name ||
       (d ? [d.date, d.merchant, d.total ? `GBP ${Number(d.total).toFixed(2)}` : ""].filter(Boolean).join(" · ") : "") ||
       item.file.name || "收据";
-    const sub = document.createElement("div");
-    sub.className = "bsub";
-    sub.textContent = [STATUS[item.status], issueText(item)].filter(Boolean).join(" · ");
-    text.append(title, sub);
-    li.append(thumb, text);
-    if (["ready", "check"].includes(item.status)) {
-      li.addEventListener("click", () => openReview(item));
-      const x = document.createElement("button");
-      x.className = "ghost bx";
-      x.textContent = "✕";
-      x.setAttribute("aria-label", "移除");
-      x.addEventListener("click", (e) => { e.stopPropagation(); queue = queue.filter((o) => o !== item); renderBatch(); });
-      li.appendChild(x);
-    }
-    ul.appendChild(li);
-  }
-  const counts = (s) => queue.filter((i) => i.status === s).length;
-  const ready = counts("ready");
+    r.sub.textContent = [STATUS[item.status], issueText(item)].filter(Boolean).join(" · ");
+    r.x.hidden = !["ready", "check", "error"].includes(item.status);
+    if (ul.children[idx] !== r.li) ul.insertBefore(r.li, ul.children[idx] || null);
+  });
+
+  const count = (s) => queue.filter((i) => i.status === s).length;
+  const ready = count("ready"), check = count("check"), reading = count("reading");
   $("batch-title").textContent =
-    `共 ${queue.length} 张 · 已归档 ${counts("filed")} · 待确认 ${counts("check")}` +
-    (counts("reading") ? ` · 识别中 ${counts("reading")}` : "");
-  $("batch-file").textContent = ready ? `归档 ${ready} 张可直接归档的` : "没有可直接归档的";
-  $("batch-file").disabled = !ready;
+    `共 ${queue.length} 张 · 可归档 ${ready} · 待确认 ${check} · 已归档 ${count("filed")}` +
+    (reading ? ` · 识别中 ${reading}` : "");
+  const btn = $("batch-file");
+  btn.disabled = !ready || reading > 0 || check > 0;
+  btn.textContent = reading ? `识别中，请稍候…`
+    : check ? `还有 ${check} 张待确认`
+    : ready ? `一键归档 ${ready} 张` : "没有要归档的";
+}
+
+// Open the edit form inside the row (accordion: one at a time).
+function expand(item) {
+  if (openId !== null && openId !== item.id) collapse();
+  openId = item.id;
+  const r = rowFor(item);
+  r.li.appendChild($("review-card"));
+  fillForm(item);
+  $("cancel").textContent = "收起";
+  $("confirm").textContent = "确认";
+  renderBatch();
+  r.li.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function collapse() {
+  $("review").appendChild($("review-card"));
+  openId = null;
+  renderBatch();
+}
+
+function expandNextCheck() {
+  const next = queue.find((i) => i.status === "check");
+  if (next) expand(next); else collapse();
 }
 
 async function fileAllReady() {
+  if (openId !== null) collapse();
   for (const item of queue.filter((i) => i.status === "ready")) {
     item.status = "filing";
     renderBatch();
     try {
       await fileItem(item);
     } catch (e) {
-      Object.assign(item, { status: "check", notes: `上传失败：${e.message}` });
+      Object.assign(item, { status: "check", confirmed: false, notes: `上传失败：${e.message}` });
     }
     renderBatch();
   }
   renderHistory();
   const left = queue.filter((i) => i.status === "check").length;
-  toast(left ? `已归档，还有 ${left} 张需要你确认` : "全部归档完成");
+  toast(left ? `有 ${left} 张没归档成功，请再确认` : "全部归档完成");
 }
 
-// ----- review form -----
+// ----- review form (single photo page, or inline in a batch row) -----
 const FIELDS = [
   ["date", "f-date"], ["merchant", "f-merchant"], ["purpose", "f-purpose"], ["property", "f-property"],
   ["total", "f-total"], ["vat", "f-vat"], ["vatNumber", "f-vatno"], ["cardLast4", "f-card"],
 ];
 
-function openReview(item) {
+function fillForm(item) {
   current = item;
   const d = item.data;
   for (const [k, id] of FIELDS) $(id).value = d[k] ?? "";
@@ -479,9 +534,15 @@ function openReview(item) {
   } else {
     prev.textContent = "📄 PDF";
   }
-  $("cancel").textContent = batchMode ? "返回列表" : "取消";
-  show("review");
   updatePlan();
+}
+
+function openReview(item) {
+  $("review").appendChild($("review-card"));
+  $("cancel").textContent = "取消";
+  $("confirm").textContent = "确认归档";
+  fillForm(item);
+  show("review");
 }
 
 function readForm() {
@@ -501,7 +562,7 @@ async function updatePlan() {
   const { company, known } = L.resolveCard(cfg.cards, d.cardLast4, item.manual);
   for (const b of document.querySelectorAll("[data-company]")) b.classList.toggle("on", b.dataset.company === company);
   const warn = $("card-warn");
-  warn.hidden = known || (company && item.manual && known);
+  warn.hidden = known;
   warn.textContent = !company
     ? `卡号 ${d.cardLast4 ? "****" + d.cardLast4 : "（没看到）"} 不是已登记的卡 —— 请选择公司`
     : `非公司卡（${d.cardLast4 ? "****" + d.cardLast4 : "没有卡号"}）→ 放进 OTHER CARD，标记需报销`;
@@ -525,19 +586,20 @@ async function confirmFile() {
   await updatePlan();
   const item = current;
   if (!item.plan) return;
+  if (batchMode) {
+    // Batch: confirming only marks it; everything is filed together at the end.
+    item.confirmed = true;
+    item.status = "ready";
+    expandNextCheck();
+    return;
+  }
   try {
     setBusy("存入 OneDrive…");
     await fileItem(item);
     renderHistory();
-    if (batchMode) {
-      renderBatch();
-      show("batch");
-      toast(`已归档：${item.saved}`);
-    } else {
-      $("done-name").textContent = item.saved;
-      $("done-folder").textContent = item.plan.folder.join(" / ") + item.regNote;
-      show("done");
-    }
+    $("done-name").textContent = item.saved;
+    $("done-folder").textContent = item.plan.folder.join(" / ") + item.regNote;
+    show("done");
   } catch (e) {
     console.error(e);
     show("review");
@@ -546,12 +608,7 @@ async function confirmFile() {
 }
 
 function leaveReview() {
-  if (batchMode) {
-    // Keep any edits; the item now needs a look rather than auto-filing.
-    if (current.status === "ready") current.status = "check";
-    renderBatch();
-    show("batch");
-  } else show("home");
+  if (batchMode) collapse(); else show("home");
 }
 
 function renderHistory() {
@@ -579,7 +636,9 @@ function renderSettings() {
 function closeBatch() {
   const open = queue.filter((i) => ["reading", "ready", "check", "filing"].includes(i.status)).length;
   if (open && !confirm(`还有 ${open} 张没归档，确定离开？（没归档的会被丢弃）`)) return;
+  if (openId !== null) collapse();
   queue = [];
+  renderBatch();
   batchMode = false;
   show("home");
 }

@@ -46,9 +46,11 @@
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .chips button { padding: 6px 12px; font-size: 14px; border-radius: 999px; }
   .blist { list-style: none; padding: 0; margin: 10px 0 14px; }
-  .bitem { display: flex; align-items: center; gap: 10px; padding: 8px; border: 1px solid var(--line);
-    border-radius: 12px; margin-bottom: 8px; cursor: pointer; }
-  .bitem.s-filed, .bitem.s-reading, .bitem.s-filing { cursor: default; opacity: .75; }
+  .bitem { padding: 8px; border: 1px solid var(--line); border-radius: 12px; margin-bottom: 8px; }
+  .bhead { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+  .bitem.s-filed .bhead, .bitem.s-reading .bhead, .bitem.s-filing .bhead { cursor: default; opacity: .75; }
+  .bitem.open { border-color: var(--brand); }
+  .bitem #review-card { margin: 10px 0 2px; padding: 12px; }
   .bitem.s-check { border-color: var(--warn); background: var(--warn-bg); }
   .bitem.s-error { border-color: var(--err); background: var(--err-bg); }
   .thumb { width: 44px; height: 56px; flex: none; border-radius: 6px; overflow: hidden; background: var(--bg);
@@ -108,7 +110,7 @@
   </section>
 
   <section id="review" hidden>
-    <div class="card">
+    <div class="card" id="review-card">
       <div id="preview"></div>
       <div id="notes" class="warn" hidden></div>
 
@@ -151,7 +153,7 @@
   <section id="batch" hidden>
     <div class="card">
       <h2 id="batch-title">批量处理</h2>
-      <p class="muted">✓ 的可以一键归档；⚠ 的点开看一下再确认。</p>
+      <p class="muted">点开每一张核对，按「确认」只是标记好，不会马上归档；全部确认完，最后按一次「一键归档」。</p>
       <ul id="batch-list" class="blist"></ul>
       <button id="batch-file" type="button" class="primary big">归档</button>
       <div class="actions">
