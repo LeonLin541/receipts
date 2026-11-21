@@ -106,6 +106,7 @@ export async function planTarget(company, cfg, r, card, listChildren) {
   }
   if (co.layout === "pu") return planPU(co, date, card, listChildren);
   if (co.layout === "inv") return planINV(co, date, card, listChildren);
+  if (co.layout === "client") return planClient(co, r, cfg.projects);
   const yearFound = matchYearFolder(await listChildren([co.root]), date);
   const year = yearFound || canonicalYearFolder(date);
   const existing = yearFound ? await listChildren([co.root, year]) : [];
@@ -186,9 +187,12 @@ async function planINV(co, date, card, listChildren) {
 
 // ----- Projects (e.g. 174CA): any company's receipt can also be logged in the project's own sheet.
 // The note says who paid, because a JML card paying for 174 keeps the cost (and VAT) in JML's books.
-export function projectNote(company, card) {
+export function projectNote(company, card, payment) {
+  // A 代开发 bank transfer has no card; who paid isn't on the screenshot, so leave the note to Leon.
+  if (company === "CLIENT" && payment === "bank_transfer") return "";
   if (card === "OTHER") return "个人垫付";
-  return { INV: "investment", JML: "Letting 垫付", PU: "PropUnited 垫付" }[company] || company;
+  // CLIENT = the client's own card / transfer for a 代开发 project: nothing to note.
+  return { INV: "investment", JML: "Letting 垫付", PU: "PropUnited 垫付", CLIENT: "" }[company] ?? company;
 }
 
 const compact = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -197,11 +201,20 @@ const compact = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 // whose code appears in the property Claude read (e.g. "174 CA" → 174CA).
 export function guessProject(projects, company, cfgCompany, property) {
   const p = compact(property);
-  const hit = (projects || []).find((pr) => p && (p.includes(compact(pr.code)) || compact(pr.code).includes(p)));
+  const names = (pr) => [pr.code, ...(pr.aliases || [])].map(compact);
+  const hit = (projects || []).find((pr) => p && names(pr).some((n) => p.includes(n) || n.includes(p)));
   return hit?.code || cfgCompany?.defaultProject || null;
 }
 
-const PAYMENT = { online: "online", card: "shop", cash: "cash" };
+const PAYMENT = { online: "online", card: "shop", cash: "cash", bank_transfer: "bank transfer" };
+
+// ----- 代开发 (client projects): no company books. The receipt goes to the project's own receipt
+// folder, named with the sheet's 编号 in front ("010 2026 11 21 39SA, Selco, …").
+function planClient(co, r, projects) {
+  const project = (projects || []).find((p) => p.code === r.property && p.company === "CLIENT");
+  if (!project) return null; // a client project must be chosen
+  return { folder: [project.folder], create: [], register: null, ledger: null };
+}
 
 // Excel stores dates as days since 1899-12-30.
 export function excelSerial(iso) {

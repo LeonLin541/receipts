@@ -197,19 +197,24 @@ async function patchRange(drv, spec, address, body) {
 // even if Excel Online's usedRange hasn't caught up with the previous write yet.
 const lastWritten = new Map();
 
-async function appendLedger(drv, spec, d) {
+// Pick the row a receipt will go in (and, for project sheets, its 编号) without writing yet.
+async function reserveRow(drv, spec) {
   const { text } = await sheetGrid(drv, spec);
   const key = `${drv.key}:${spec.path}:${spec.sheet}`;
   const found = L.nextLedgerRow(text, spec.kind);
   const row = found && Math.max(found, (lastWritten.get(key) || 0) + 1);
-  if (row) lastWritten.set(key, row);
   if (!row) throw new Error(`${spec.sheet} 表已经填满（第 17–51 行），请在表里加行`);
+  lastWritten.set(key, row);
+  const prefilled = String(text[row - 1]?.[2] ?? "").trim();
+  const newNumber = spec.kind === "project" ? L.projectNumber(text, row) : null; // null = keep pre-filled
+  return { row, number: prefilled || newNumber, newNumber };
+}
+
+async function appendLedger(drv, spec, d, reserved) {
+  const { row, newNumber } = reserved || (await reserveRow(drv, spec));
   const cells = L.ledgerCells(spec.kind, d);
   await patchRange(drv, spec, `B${row}`, { values: [[L.excelSerial(d.date)]], numberFormat: [[spec.dateFormat || "dd/mm/yyyy"]] });
-  if (spec.kind === "project") {
-    const no = L.projectNumber(text, row); // null = number already pre-filled in C
-    if (no) await patchRange(drv, spec, `C${row}`, { values: [[no]], numberFormat: [["@"]] });
-  }
+  if (newNumber) await patchRange(drv, spec, `C${row}`, { values: [[newNumber]], numberFormat: [["@"]] });
   await patchRange(drv, spec, `${cells.first}${row}:${cells.last}${row}`, { values: [cells.values] });
   if (cells.reimbursed) await patchRange(drv, spec, `J${row}`, { values: [[cells.reimbursed]] });
   return row;
@@ -218,7 +223,7 @@ async function appendLedger(drv, spec, d) {
 // Register/ledger writes that failed (file locked, offline…) are retried next time.
 async function writeLog(entry) {
   const drv = await driveFor(entry.company);
-  if (entry.ledger) await appendLedger(drv, entry.ledger, entry.d);
+  if (entry.ledger) await appendLedger(drv, entry.ledger, entry.d, entry.reserved);
   else await appendRegister(drv, entry.reg, entry.row);
 }
 
@@ -226,7 +231,7 @@ async function flushPendingRows() {
   const pending = store.get("pendingRows", []);
   const left = [];
   for (const p of pending) {
-    try { await writeLog({ company: "JML", ...p }); } catch { left.push(p); }
+    try { await writeLog({ company: "JML", ...p, reserved: undefined }); } catch { left.push(p); }
   }
   store.set("pendingRows", left);
   return left.length;
@@ -258,7 +263,7 @@ const SCHEMA = {
     vat_amount: { type: "number", description: "VAT amount shown, 0 if none" },
     supplier_vat_number: { type: "string", description: "supplier VAT registration number, digits/GB only, empty if none" },
     card_last4: { type: "string", description: "last 4 digits of the paying card, empty if not shown or ambiguous" },
-    payment_method: { type: "string", description: "card, cash, online, or unknown" },
+    payment_method: { type: "string", description: "card, cash, online, bank_transfer, or unknown" },
     notes: { type: "string", description: "in Simplified Chinese: anything uncertain Leon should check; empty if all clear" },
   },
   required: [
@@ -278,6 +283,7 @@ Rules:
 - property: identify the property only from the receipt itself (delivery address, item text, handwritten note). Code rule: ${cfg?.propertyCodeRule || "house number + street initials"}. Known properties: ${(cfg?.properties || []).join("; ")}.
 - purpose: short and specific, e.g. "repair light", "paint", "parking", "mattress protector".
 - Food and drink (restaurants, cafes, coffee, McDonald's, takeaway, snacks, supermarket meal deals) always get exactly one of these purposes: "Working Lunch" if the transaction time is before 17:00 or not shown, "Working Dinner" if 17:00 or later. Never describe the food itself.
+- A bank transfer confirmation (banking app screenshot) counts as payment evidence: is_receipt = true, payment_method = "bank_transfer", merchant = the payee, purpose from the payment reference, card_last4 empty.
 - notes: write in Simplified Chinese, only for things Leon should double-check.`;
 }
 
@@ -395,12 +401,24 @@ async function planItem(item) {
   if (!item.projectPicked) item.project = L.guessProject(cfg.projects, company, co, d.property);
   const project = (cfg.projects || []).find((p) => p.code === item.project) || null;
   if (project) d.property = project.code; // file name then carries the project, e.g. "…, 174CA, GBP …"
+  if (co.layout === "client" && project?.company !== "CLIENT") return; // 代开发 needs one of its projects
   const drv = await driveFor(company);
   // A company that is not VAT registered never gets ", VAT x.xx" in its file names.
-  item.name = L.buildFileName(co.vatRegistered === false ? { ...d, isVat: false } : d, item.ext);
+  // 代开发: the project code takes the company slot ("39SA, Selco, …").
+  const nameData = co.layout === "client"
+    ? { ...d, company: project?.code, property: "", isVat: false }
+    : co.vatRegistered === false ? { ...d, isVat: false } : d;
+  item.name = L.buildFileName(nameData, item.ext);
   item.plan = await L.planTarget(company, cfg, d, card, (segs) => listChildren(drv, segs));
+  if (!item.plan) return; // 代开发 without a project chosen
   item.plan.project = project
-    ? { company: project.company, ledger: { kind: "project", ...project.ledger }, note: L.projectNote(company, card) }
+    ? {
+        company: project.company,
+        ledger: { kind: "project", ...project.ledger },
+        note: L.projectNote(company, card, d.payment),
+        // Receipts filed in the project's own folder carry the sheet's 编号 in front of the name.
+        numbered: Boolean(project.numbered && project.company === company),
+      }
     : null;
   let dupSaved = false;
   if (item.plan.register) {
@@ -410,10 +428,16 @@ async function planItem(item) {
     const grid = await sheetGrid(drv, item.plan.ledger).catch(() => null);
     dupSaved = Boolean(grid && L.ledgerHasDup(grid.values, item.plan.ledger.kind, d));
   }
-  if (item.plan.project && !dupSaved) {
+  if (item.plan.project) {
     const pdrv = await driveFor(item.plan.project.company);
     const grid = await sheetGrid(pdrv, item.plan.project.ledger).catch(() => null);
-    dupSaved = Boolean(grid && L.ledgerHasDup(grid.values, "project", d));
+    dupSaved = dupSaved || Boolean(grid && L.ledgerHasDup(grid.values, "project", d));
+    if (item.plan.project.numbered && grid) {
+      // Preview only; the real 编号 is taken again when filing.
+      const row = L.nextLedgerRow(grid.text, "project");
+      const no = String(grid.text[row - 1]?.[2] ?? "").trim() || L.projectNumber(grid.text, row);
+      item.plan.previewName = `${no} ${item.name}`;
+    }
   }
   const sameInBatch = queue.some((o) => o !== item && o.data && o.status !== "error" &&
     o.data.date === d.date && Number(o.data.total) === Number(d.total) && o.company === company);
@@ -429,12 +453,15 @@ async function fileItem(item) {
   const { plan, name, data: d } = item;
   const drv = await driveFor(item.company);
   for (const segs of plan.create) await ensureFolder(drv, segs);
-  const saved = await uploadUnique(drv, plan.folder, name, item.blob);
+  // Numbered project receipts: take the sheet row first, so the file name and the row share one 编号.
+  let reserved = null;
+  if (plan.project?.numbered) reserved = await reserveRow(await driveFor(plan.project.company), plan.project.ledger);
+  const saved = await uploadUnique(drv, plan.folder, reserved ? `${reserved.number} ${name}` : name, item.blob);
   // Company log (JML CSV register / PU Excel ledger / none for Investment) + project sheet if tagged.
   const entries = [];
   if (plan.register) entries.push({ company: item.company, reg: plan.register, row: L.registerRow(d, item.card, [...plan.folder.slice(1), saved].join("/"), item.sourceName) });
   else if (plan.ledger) entries.push({ company: item.company, ledger: plan.ledger, d: { ...d } });
-  if (plan.project) entries.push({ company: plan.project.company, ledger: plan.project.ledger, d: { ...d, note: plan.project.note } });
+  if (plan.project) entries.push({ company: plan.project.company, ledger: plan.project.ledger, d: { ...d, note: plan.project.note }, reserved });
   let regNote = "";
   await flushPendingRows().catch(() => {});
   for (const entry of entries) {
@@ -573,7 +600,7 @@ function renderBatch() {
       r.thumb.appendChild(img);
     } else if (!item.previewBlob) r.thumb.textContent = item.status === "reading" ? "…" : "📄";
     const d = item.data;
-    r.title.textContent = item.saved || item.name ||
+    r.title.textContent = item.saved || item.plan?.previewName || item.name ||
       (d ? [d.date, d.merchant, d.total ? `GBP ${Number(d.total).toFixed(2)}` : ""].filter(Boolean).join(" · ") : "") ||
       item.file.name || "收据";
     r.sub.textContent = [STATUS[item.status], issueText(item)].filter(Boolean).join(" · ");
@@ -694,10 +721,15 @@ async function updatePlan() {
   try {
     await planItem(item);
     if (seq !== planSeq) return;
-    if (!item.plan) { $("plan").textContent = company ? "请补全日期和金额" : "选择公司后显示归档位置"; return; }
+    if (!item.plan) {
+      const needProject = company && cfg.companies[company]?.layout === "client" && L.parseISO(item.data.date) && item.data.total > 0;
+      $("plan").textContent = needProject ? "代开发：请在上面选项目" : company ? "请补全日期和金额" : "选择公司后显示归档位置";
+      renderProjects(item);
+      return;
+    }
     const pj = item.plan.project;
-    $("plan").textContent = `${item.name}\n→ ${item.plan.folder.join(" / ")}${item.plan.create.length ? "（新建）" : ""}` +
-      (pj ? `\n+ 记进 ${pj.ledger.path.split("/").pop()}（备注：${pj.note}）` : "");
+    $("plan").textContent = `${item.plan.previewName || item.name}\n→ ${item.plan.folder.join(" / ")}${item.plan.create.length ? "（新建）" : ""}` +
+      (pj ? `\n+ 记进 ${pj.ledger.path.split("/").pop()}${pj.note ? `（备注：${pj.note}）` : ""}` : "");
     if (item.project && $("f-property").value !== d.property) $("f-property").value = d.property;
     renderProjects(item);
     $("dup-warn").hidden = !item.dup;

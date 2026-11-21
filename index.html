@@ -41,7 +41,7 @@
     width: 100%; font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
     background: var(--bg); color: var(--ink); }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 6px; }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
   .seg button.on { background: var(--brand); color: var(--brand-ink); font-weight: 600; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .chips button { padding: 6px 12px; font-size: 14px; border-radius: 999px; }
@@ -120,6 +120,7 @@
         <button type="button" data-company="JML">JML</button>
         <button type="button" data-company="PU">Prop United</button>
         <button type="button" data-company="INV">Investment</button>
+        <button type="button" data-company="CLIENT">代开发</button>
       </div>
       <div id="card-warn" class="warn" hidden></div>
       <label>项目（会同时记进项目表格）</label>
