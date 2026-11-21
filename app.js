@@ -193,12 +193,23 @@ async function patchRange(drv, spec, address, body) {
   if (!res.ok) throw await gError(res, `写入 ${spec.sheet}`);
 }
 
+// Last row written per sheet in this session: back-to-back writes never reuse a row,
+// even if Excel Online's usedRange hasn't caught up with the previous write yet.
+const lastWritten = new Map();
+
 async function appendLedger(drv, spec, d) {
   const { text } = await sheetGrid(drv, spec);
-  const row = L.nextLedgerRow(text, spec.kind);
+  const key = `${drv.key}:${spec.path}:${spec.sheet}`;
+  const found = L.nextLedgerRow(text, spec.kind);
+  const row = found && Math.max(found, (lastWritten.get(key) || 0) + 1);
+  if (row) lastWritten.set(key, row);
   if (!row) throw new Error(`${spec.sheet} 表已经填满（第 17–51 行），请在表里加行`);
   const cells = L.ledgerCells(spec.kind, d);
-  await patchRange(drv, spec, `B${row}`, { values: [[L.excelSerial(d.date)]], numberFormat: [["dd/mm/yyyy"]] });
+  await patchRange(drv, spec, `B${row}`, { values: [[L.excelSerial(d.date)]], numberFormat: [[spec.dateFormat || "dd/mm/yyyy"]] });
+  if (spec.kind === "project") {
+    const no = L.projectNumber(text, row); // null = number already pre-filled in C
+    if (no) await patchRange(drv, spec, `C${row}`, { values: [[no]], numberFormat: [["@"]] });
+  }
   await patchRange(drv, spec, `${cells.first}${row}:${cells.last}${row}`, { values: [cells.values] });
   if (cells.reimbursed) await patchRange(drv, spec, `J${row}`, { values: [[cells.reimbursed]] });
   return row;
@@ -362,7 +373,7 @@ async function analyse(item) {
   item.data = {
     date: x.date, merchant: x.merchant, purpose: x.purpose, property: x.property,
     currency: x.currency || "GBP", total: x.total, vat: x.vat_amount, vatNumber: x.supplier_vat_number,
-    cardLast4: x.card_last4, isVat: Boolean(x.supplier_vat_number) && x.vat_amount > 0,
+    cardLast4: x.card_last4, isVat: Boolean(x.supplier_vat_number) && x.vat_amount > 0, payment: x.payment_method,
   };
   item.notes = [
     !x.is_receipt && "这看起来不是收据/发票。",
@@ -380,17 +391,29 @@ async function planItem(item) {
   if (!company || !L.parseISO(d.date) || !(d.total > 0)) return;
   d.company = company;
   const co = cfg.companies[company];
+  // Project (e.g. 174CA): Leon's pick, else a guess from the company default / property read.
+  if (!item.projectPicked) item.project = L.guessProject(cfg.projects, company, co, d.property);
+  const project = (cfg.projects || []).find((p) => p.code === item.project) || null;
+  if (project) d.property = project.code; // file name then carries the project, e.g. "…, 174CA, GBP …"
   const drv = await driveFor(company);
   // A company that is not VAT registered never gets ", VAT x.xx" in its file names.
   item.name = L.buildFileName(co.vatRegistered === false ? { ...d, isVat: false } : d, item.ext);
   item.plan = await L.planTarget(company, cfg, d, card, (segs) => listChildren(drv, segs));
+  item.plan.project = project
+    ? { company: project.company, ledger: { kind: "project", ...project.ledger }, note: L.projectNote(company, card) }
+    : null;
   let dupSaved = false;
   if (item.plan.register) {
     const reg = await readText(drv, item.plan.register).catch(() => null);
     dupSaved = Boolean(reg && L.findDuplicate(reg, d));
-  } else {
+  } else if (item.plan.ledger) {
     const grid = await sheetGrid(drv, item.plan.ledger).catch(() => null);
     dupSaved = Boolean(grid && L.ledgerHasDup(grid.values, item.plan.ledger.kind, d));
+  }
+  if (item.plan.project && !dupSaved) {
+    const pdrv = await driveFor(item.plan.project.company);
+    const grid = await sheetGrid(pdrv, item.plan.project.ledger).catch(() => null);
+    dupSaved = Boolean(grid && L.ledgerHasDup(grid.values, "project", d));
   }
   const sameInBatch = queue.some((o) => o !== item && o.data && o.status !== "error" &&
     o.data.date === d.date && Number(o.data.total) === Number(d.total) && o.company === company);
@@ -407,16 +430,20 @@ async function fileItem(item) {
   const drv = await driveFor(item.company);
   for (const segs of plan.create) await ensureFolder(drv, segs);
   const saved = await uploadUnique(drv, plan.folder, name, item.blob);
-  const entry = plan.register
-    ? { company: item.company, reg: plan.register, row: L.registerRow(d, item.card, [...plan.folder.slice(1), saved].join("/"), item.sourceName) }
-    : { company: item.company, ledger: plan.ledger, d: { ...d } };
+  // Company log (JML CSV register / PU Excel ledger / none for Investment) + project sheet if tagged.
+  const entries = [];
+  if (plan.register) entries.push({ company: item.company, reg: plan.register, row: L.registerRow(d, item.card, [...plan.folder.slice(1), saved].join("/"), item.sourceName) });
+  else if (plan.ledger) entries.push({ company: item.company, ledger: plan.ledger, d: { ...d } });
+  if (plan.project) entries.push({ company: plan.project.company, ledger: plan.project.ledger, d: { ...d, note: plan.project.note } });
   let regNote = "";
-  try {
-    await flushPendingRows();
-    await writeLog(entry);
-  } catch {
-    store.set("pendingRows", [...store.get("pendingRows", []), entry]);
-    regNote = plan.register ? "（登记表暂时写不进去，下次自动补写）" : "（流水账暂时写不进去，下次自动补写）";
+  await flushPendingRows().catch(() => {});
+  for (const entry of entries) {
+    try {
+      await writeLog(entry);
+    } catch {
+      store.set("pendingRows", [...store.get("pendingRows", []), entry]);
+      regNote = "（有表格暂时写不进去，下次自动补写）";
+    }
   }
   const hist = store.get("history", []);
   hist.unshift({ name: saved, folder: plan.folder.join(" / "), at: new Date().toISOString() });
@@ -668,11 +695,29 @@ async function updatePlan() {
     await planItem(item);
     if (seq !== planSeq) return;
     if (!item.plan) { $("plan").textContent = company ? "请补全日期和金额" : "选择公司后显示归档位置"; return; }
-    $("plan").textContent = `${item.name}\n→ ${item.plan.folder.join(" / ")}${item.plan.create.length ? "（新建）" : ""}`;
+    const pj = item.plan.project;
+    $("plan").textContent = `${item.name}\n→ ${item.plan.folder.join(" / ")}${item.plan.create.length ? "（新建）" : ""}` +
+      (pj ? `\n+ 记进 ${pj.ledger.path.split("/").pop()}（备注：${pj.note}）` : "");
+    if (item.project && $("f-property").value !== d.property) $("f-property").value = d.property;
+    renderProjects(item);
     $("dup-warn").hidden = !item.dup;
     $("confirm").disabled = false;
   } catch (e) {
     if (seq === planSeq) $("plan").textContent = e.message;
+  }
+}
+
+// Project chips: "不归项目" + one per project in the settings file.
+function renderProjects(item) {
+  const box = $("projects");
+  box.innerHTML = "";
+  for (const p of [{ code: null, label: "不归项目" }, ...(cfg.projects || []).map((p) => ({ code: p.code, label: p.code }))]) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = p.label;
+    b.classList.toggle("on", (item.project || null) === p.code);
+    b.addEventListener("click", () => { item.project = p.code; item.projectPicked = true; updatePlan(); });
+    box.appendChild(b);
   }
 }
 

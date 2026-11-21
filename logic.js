@@ -105,6 +105,7 @@ export async function planTarget(company, cfg, r, card, listChildren) {
     return { folder: [co.root], create: [], register: [co.root, co.register || "Receipt Register.csv"] };
   }
   if (co.layout === "pu") return planPU(co, date, card, listChildren);
+  if (co.layout === "inv") return planINV(co, date, card, listChildren);
   const yearFound = matchYearFolder(await listChildren([co.root]), date);
   const year = yearFound || canonicalYearFolder(date);
   const existing = yearFound ? await listChildren([co.root, year]) : [];
@@ -157,6 +158,51 @@ async function planPU(co, date, card, listChildren) {
   };
 }
 
+// ----- JML Investment: year runs 1 Dec – 30 Nov, receipts sit straight in the year's tax folder
+// ("07 0112 2025-30 11 2026 报税"), personal/cash in a subfolder, no company ledger.
+export function invYearFolder(date) {
+  const s = fyStartYearOn(date, "12-01");
+  return `${pad(s - 2018)} 0112 ${s}-30 11 ${s + 1} 报税`;
+}
+
+export function matchInvYear(names, date) {
+  const s = fyStartYearOn(date, "12-01");
+  return names.find((n) => norm(n).includes(`0112 ${s}-30 11 ${s + 1}`)) || null;
+}
+
+async function planINV(co, date, card, listChildren) {
+  const yearFound = matchInvYear(await listChildren([co.root]), date);
+  const year = yearFound || invYearFolder(date);
+  const personal = card === "OTHER";
+  const folder = personal ? [co.root, year, co.personalFolder] : [co.root, year];
+  const subExists = personal && yearFound && (await listChildren([co.root, year])).includes(co.personalFolder);
+  return {
+    folder,
+    create: [...(yearFound ? [] : [[co.root, year]]), ...(personal && !subExists ? [folder] : [])],
+    register: null,
+    ledger: null,
+  };
+}
+
+// ----- Projects (e.g. 174CA): any company's receipt can also be logged in the project's own sheet.
+// The note says who paid, because a JML card paying for 174 keeps the cost (and VAT) in JML's books.
+export function projectNote(company, card) {
+  if (card === "OTHER") return "个人垫付";
+  return { INV: "investment", JML: "Letting 垫付", PU: "PropUnited 垫付" }[company] || company;
+}
+
+const compact = (s) => String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+
+// Which project a receipt belongs to before Leon picks one: the company's default, else a project
+// whose code appears in the property Claude read (e.g. "174 CA" → 174CA).
+export function guessProject(projects, company, cfgCompany, property) {
+  const p = compact(property);
+  const hit = (projects || []).find((pr) => p && (p.includes(compact(pr.code)) || compact(pr.code).includes(p)));
+  return hit?.code || cfgCompany?.defaultProject || null;
+}
+
+const PAYMENT = { online: "online", card: "shop", cash: "cash" };
+
 // Excel stores dates as days since 1899-12-30.
 export function excelSerial(iso) {
   const { y, m, d } = parseISO(iso);
@@ -173,6 +219,10 @@ export function ledgerCells(kind, r) {
     //       D Description, E Paid Out, F In, G Bal, H, I Explanation, J, K Receipt, L Filing, M, N Net, O VAT, P Gross
     return { first: "D", last: "P", values: [r.merchant, total, "", "", "", explanation, "", "Y", "", "", "", "", total] };
   }
+  if (kind === "project") {
+    //       D 退货, E 支出, F 内容, G 商店, H 方式, I 备注   (C 编号 is pre-filled / handled separately)
+    return { first: "D", last: "I", values: ["", total, r.purpose, r.merchant, PAYMENT[r.payment] || "", r.note || ""] };
+  }
   //       C Supplier, D Description, E Net, F VAT, G Total, H Receipt
   return { first: "C", last: "H", values: [r.merchant, explanation, total, "", total, "Y"], reimbursed: "N" };
 }
@@ -184,7 +234,7 @@ export function ledgerCells(kind, r) {
 export function ledgerHasDup(values, kind, r) {
   const serial = excelSerial(r.date);
   const uk = ukDate(r.date);
-  const amountCol = kind === "bank" ? 4 : 6;
+  const amountCol = kind === "expense" ? 6 : 4;
   const total = Number(r.total).toFixed(2);
   return values.some((row) => {
     const d = row[1];
@@ -196,6 +246,13 @@ export function ledgerHasDup(values, kind, r) {
 // Next free row: bank sheet = after the last row with anything in B..P (data starts at row 15);
 // Expense Claims = first row 17..51 with no date, supplier or total (EX numbers are pre-filled in I).
 export function nextLedgerRow(text, kind) {
+  if (kind === "project") {
+    // Project sheet ("材料购买1"): row after the last one with a description or shop (data from row 4;
+    // numbers 027, 028… are pre-filled in C; the SUM row has an amount but no description, so ignore amounts).
+    let last = 3;
+    text.forEach((row, i) => { if (i >= 3 && [row[5], row[6]].some((c) => String(c ?? "").trim())) last = i + 1; });
+    return last + 1;
+  }
   if (kind === "bank") {
     let last = 14;
     text.forEach((row, i) => { if (i >= 14 && row.slice(1, 16).some((c) => String(c).trim())) last = i + 1; });
@@ -207,6 +264,15 @@ export function nextLedgerRow(text, kind) {
   }
   return null;
 }
+
+// Project number for a row: keep a pre-filled one, else one more than the highest so far ("027").
+export function projectNumber(text, row) {
+  const existing = String(text[row - 1]?.[2] ?? "").trim();
+  if (existing) return null;
+  const max = Math.max(0, ...text.slice(3, row - 1).map((r) => parseInt(String(r?.[2] ?? ""), 10)).filter((n) => !isNaN(n)));
+  return pad3(max + 1);
+}
+const pad3 = (n) => String(n).padStart(3, "0");
 
 export const REGISTER_HEADER = [
   "Date", "Company", "Merchant", "Purpose", "Property", "Total", "VAT", "Net", "VAT receipt",

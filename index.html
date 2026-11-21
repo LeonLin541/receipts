@@ -41,10 +41,11 @@
     width: 100%; font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line);
     background: var(--bg); color: var(--ink); }
   .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-  .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
+  .seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 6px; }
   .seg button.on { background: var(--brand); color: var(--brand-ink); font-weight: 600; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .chips button { padding: 6px 12px; font-size: 14px; border-radius: 999px; }
+  .chips button.on { background: var(--brand); color: var(--brand-ink); font-weight: 600; }
   .blist { list-style: none; padding: 0; margin: 10px 0 14px; }
   .bitem { padding: 8px; border: 1px solid var(--line); border-radius: 12px; margin-bottom: 8px; }
   .bhead { display: flex; align-items: center; gap: 10px; cursor: pointer; }
@@ -118,8 +119,11 @@
       <div class="seg">
         <button type="button" data-company="JML">JML</button>
         <button type="button" data-company="PU">Prop United</button>
+        <button type="button" data-company="INV">Investment</button>
       </div>
       <div id="card-warn" class="warn" hidden></div>
+      <label>项目（会同时记进项目表格）</label>
+      <div class="chips" id="projects"></div>
 
       <div class="row">
         <div><label for="f-date">日期</label><input id="f-date" type="date"></div>
