@@ -81,6 +81,9 @@ async function g(drv, url, opts = {}) {
 async function gError(res, what) {
   let detail = "";
   try { detail = (await res.json()).error?.message || ""; } catch {}
+  if (res.status === 401) {
+    return new Error(`Microsoft 登录已过期（${what}，401）—— 请到 ⚙ 设置里点「退出登录」再重新登录`);
+  }
   return new Error(`${what} 失败 (${res.status}) ${detail}`);
 }
 
@@ -309,13 +312,24 @@ async function extract(blob, mediaType) {
     // Server-side fallback: if a safety classifier declines, the API retries on a fallback model.
     msg = await client.beta.messages.create({ ...params, betas: ["server-side-fallback-2026-07-01"], fallbacks: "default" });
   } catch (e) {
-    if (e?.status !== 400) throw e;
-    msg = await client.messages.create(params);
+    if (e?.status === 400) msg = await client.messages.create(params).catch((e2) => { throw claudeError(e2); });
+    else throw claudeError(e);
   }
   if (msg.stop_reason === "refusal") throw new Error("Claude 拒绝处理这张图片");
   if (msg.stop_reason === "max_tokens") throw new Error("识别输出被截断，请重试");
   const text = msg.content.filter((b) => b.type === "text").map((b) => b.text).join("");
   return JSON.parse(text);
+}
+
+// Plain-language messages for the Claude API errors Leon is likely to hit.
+function claudeError(e) {
+  const s = e?.status;
+  if (s === 401) return new Error("Claude API key 无效（401）—— 可能被删除/停用或粘贴不完整。请到 console.anthropic.com 生成新 key，在 ⚙ 设置里重新粘贴");
+  if (s === 403) return new Error("Claude API key 没有权限（403）—— 请检查 console.anthropic.com 里这个 key 所在的工作区");
+  if (s === 429) return new Error("Claude 请求太频繁或达到额度上限（429）—— 稍等再试，或检查 console.anthropic.com 的 Limits");
+  if (s === 400 && /credit balance/i.test(e?.message || "")) return new Error("Claude 账户余额不足 —— 请到 console.anthropic.com → Billing 充值");
+  if (s >= 500) return new Error(`Claude 服务暂时出错（${s}）—— 稍后重试`);
+  return e;
 }
 
 function blobToBase64(blob) {
