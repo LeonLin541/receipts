@@ -155,11 +155,33 @@ async function uploadUnique(drv, folderSegs, name, blob) {
   throw new Error("同名文件太多");
 }
 
-async function appendRegister(drv, regSegs, row) {
-  const text = (await readText(drv, regSegs)) ?? L.REGISTER_HEADER.map((h) => `"${h}"`).join(",");
-  const body = new Blob(["﻿" + text.replace(/\s*$/, "") + "\r\n" + row + "\r\n"], { type: "text/csv" });
-  const res = await upload(drv, regSegs, body, "replace");
+// Append a register line — or, with `replaceFor` (the receipt's data), overwrite the line of the
+// same receipt if there is one.
+async function appendRegister(drv, regSegs, row, replaceFor) {
+  let text = (await readText(drv, regSegs)) ?? L.REGISTER_HEADER.map((h) => `"${h}"`).join(",");
+  const i = replaceFor ? L.findDuplicateLine(text, replaceFor) : -1;
+  if (i > 0) {
+    const lines = text.split(/\r?\n/);
+    lines[i] = row;
+    text = lines.join("\r\n").replace(/\s*$/, "") + "\r\n";
+  } else {
+    text = text.replace(/\s*$/, "") + "\r\n" + row + "\r\n";
+  }
+  const res = await upload(drv, regSegs, new Blob(["﻿" + text], { type: "text/csv" }), "replace");
   if (!res.ok) throw await gError(res, "写入登记表");
+}
+
+async function listFiles(drv, segs) {
+  const res = await g(drv, `${itemUrl(drv, segs)}/children?$select=name,file&$top=999`);
+  if (res.status === 404) return [];
+  if (!res.ok) throw await gError(res, "读取文件夹");
+  return (await res.json()).value.filter((x) => x.file).map((x) => x.name);
+}
+
+// Deleted OneDrive/SharePoint files go to the recycle bin (recoverable for 93 days).
+async function deleteFile(drv, segs) {
+  const res = await g(drv, itemUrl(drv, segs), { method: "DELETE" });
+  if (!res.ok && res.status !== 404) throw await gError(res, "删除旧收据");
 }
 
 // ---------- Excel ledgers (PropUnited bank sheet / Expense Claims) ----------
@@ -224,10 +246,21 @@ async function appendLedger(drv, spec, d, reserved) {
 }
 
 // Register/ledger writes that failed (file locked, offline…) are retried next time.
+// The row of the same receipt already in a sheet (to overwrite it), or null.
+async function existingRow(drv, spec, d) {
+  const { text, values } = await sheetGrid(drv, spec);
+  const row = L.findLedgerRow(values, spec.kind, d);
+  return row ? { row, number: String(text[row - 1]?.[2] ?? "").trim(), newNumber: null } : null;
+}
+
 async function writeLog(entry) {
   const drv = await driveFor(entry.company);
-  if (entry.ledger) await appendLedger(drv, entry.ledger, entry.d, entry.reserved);
-  else await appendRegister(drv, entry.reg, entry.row);
+  if (entry.ledger) {
+    const reserved = entry.reserved || (entry.replace && (await existingRow(drv, entry.ledger, entry.d))) || undefined;
+    await appendLedger(drv, entry.ledger, entry.d, reserved);
+  } else {
+    await appendRegister(drv, entry.reg, entry.row, entry.replace ? entry.d : null);
+  }
 }
 
 async function flushPendingRows() {
@@ -267,11 +300,12 @@ const SCHEMA = {
     supplier_vat_number: { type: "string", description: "supplier VAT registration number, digits/GB only, empty if none" },
     card_last4: { type: "string", description: "last 4 digits of the paying card, empty if not shown or ambiguous" },
     payment_method: { type: "string", description: "card, cash, online, bank_transfer, or unknown" },
+    doc_type: { type: "string", description: "order = order confirmation / order acknowledgement sent before delivery (not the final receipt); receipt = till receipt, tax invoice or paid invoice; other" },
     notes: { type: "string", description: "in Simplified Chinese: anything uncertain Leon should check; empty if all clear" },
   },
   required: [
     "is_receipt", "multiple_receipts", "date", "merchant", "purpose", "property", "currency", "total",
-    "vat_amount", "supplier_vat_number", "card_last4", "payment_method", "notes",
+    "vat_amount", "supplier_vat_number", "card_last4", "payment_method", "doc_type", "notes",
   ],
 };
 
@@ -286,6 +320,7 @@ Rules:
 - property: identify the property only from the receipt itself (delivery address, item text, handwritten note). Code rule: ${cfg?.propertyCodeRule || "house number + street initials"}. Known properties: ${(cfg?.properties || []).join("; ")}.
 - purpose: short and specific, e.g. "repair light", "paint", "parking", "mattress protector".
 - Food and drink (restaurants, cafes, coffee, McDonald's, takeaway, snacks, supermarket meal deals) always get exactly one of these purposes: "Working Lunch" if the transaction time is before 17:00 or not shown, "Working Dinner" if 17:00 or later. Never describe the food itself.
+- doc_type: "order" for an order confirmation or acknowledgement (often says "Order confirmation", "Thank you for your order", "Order received"; issued before delivery), "receipt" for a till receipt, tax invoice or paid invoice issued at sale or after delivery.
 - A bank transfer confirmation (banking app screenshot) counts as payment evidence: is_receipt = true, payment_method = "bank_transfer", merchant = the payee, purpose from the payment reference, card_last4 empty.
 - notes: write in Simplified Chinese, only for things Leon should double-check.`;
 }
@@ -391,7 +426,9 @@ async function analyse(item) {
   item.ext = "pdf";
   item.sourceName = file.name || "camera.jpg";
   item.data = {
-    date: x.date, merchant: x.merchant, purpose: x.purpose, property: x.property,
+    date: x.date, merchant: x.merchant, property: x.property,
+    // Order confirmations are tagged so the formal invoice that follows can replace them.
+    purpose: x.doc_type === "order" && !x.purpose.toLowerCase().includes(L.ORDER_TAG) ? `${x.purpose} ${L.ORDER_TAG}` : x.purpose,
     currency: x.currency || "GBP", total: x.total, vat: x.vat_amount, vatNumber: x.supplier_vat_number,
     cardLast4: x.card_last4, isVat: Boolean(x.supplier_vat_number) && x.vat_amount > 0, payment: x.payment_method,
   };
@@ -434,48 +471,84 @@ async function planItem(item) {
         numbered: Boolean(project.numbered && project.company === company),
       }
     : null;
-  let dupSaved = false;
+  // Same receipt already filed (date + amount + merchant)? Then filing will replace it.
+  let dupWhat = "";
   if (item.plan.register) {
     const reg = await readText(drv, item.plan.register).catch(() => null);
-    dupSaved = Boolean(reg && L.findDuplicate(reg, d));
+    const i = reg ? L.findDuplicateLine(reg, d) : -1;
+    if (i > 0) dupWhat = (L.registerLineFile(reg.split(/\r?\n/)[i]) || "").split("/").pop() || "登记表里的旧记录";
   } else if (item.plan.ledger) {
     const grid = await sheetGrid(drv, item.plan.ledger).catch(() => null);
-    dupSaved = Boolean(grid && L.ledgerHasDup(grid.values, item.plan.ledger.kind, d));
+    const row = grid ? L.findLedgerRow(grid.values, item.plan.ledger.kind, d) : 0;
+    if (row) dupWhat = `${item.plan.ledger.sheet} 第 ${row} 行`;
   }
   if (item.plan.project) {
     const pdrv = await driveFor(item.plan.project.company);
     const grid = await sheetGrid(pdrv, item.plan.project.ledger).catch(() => null);
-    dupSaved = dupSaved || Boolean(grid && L.ledgerHasDup(grid.values, "project", d));
+    const row = grid ? L.findLedgerRow(grid.values, "project", d) : 0;
+    if (row && !dupWhat) dupWhat = `${item.plan.project.ledger.sheet} 第 ${row} 行（编号 ${String(grid.text[row - 1]?.[2] ?? "").trim()}）`;
     if (item.plan.project.numbered && grid) {
-      // Preview only; the real 编号 is taken again when filing.
-      const row = L.nextLedgerRow(grid.text, "project");
-      const no = String(grid.text[row - 1]?.[2] ?? "").trim() || L.projectNumber(grid.text, row);
+      // Preview only; the real 编号 is taken again when filing (a replaced receipt keeps its old one).
+      const r = row || L.nextLedgerRow(grid.text, "project");
+      const no = String(grid.text[r - 1]?.[2] ?? "").trim() || L.projectNumber(grid.text, r);
       item.plan.previewName = `${no} ${item.name}`;
     }
   }
-  const sameInBatch = queue.some((o) => o !== item && o.data && o.status !== "error" &&
-    o.data.date === d.date && Number(o.data.total) === Number(d.total) && o.company === company);
-  item.dup = dupSaved || sameInBatch;
+  const twin = queue.find((o) => o !== item && o.data && o.status !== "error" && o.company === company &&
+    L.samePurchase(o.data, d));
+  if (twin && !dupWhat) dupWhat = "这批里的另一张";
+  item.dup = Boolean(dupWhat);
+  item.dupWhat = dupWhat;
 }
 
 // "ready" = nothing for Leon to check: known company card, date + amount read, no notes, no duplicate.
 function judge(item) {
-  item.status = item.confirmed || (item.plan && item.known && !item.manual && !item.notes && !item.dup) ? "ready" : "check";
+  // A duplicate no longer needs a look: filing replaces the old copy (unless "两张都保留" is ticked).
+  item.status = item.confirmed || (item.plan && item.known && !item.manual && !item.notes) ? "ready" : "check";
+}
+
+// Where the earlier copy of this receipt was saved: JML's register records the path; otherwise
+// look in the target folder for a file with the same date, amount and merchant in its name.
+async function findOldFilePath(drv, plan, d) {
+  if (plan.register) {
+    const text = await readText(drv, plan.register);
+    const i = text ? L.findDuplicateLine(text, d) : -1;
+    const rel = i > 0 ? L.registerLineFile(text.split(/\r?\n/)[i]) : null;
+    if (rel) return [plan.folder[0], ...rel.split("/")];
+  }
+  const old = L.findOldFile(await listFiles(drv, plan.folder), d);
+  return old ? [...plan.folder, old] : null;
 }
 
 async function fileItem(item) {
   const { plan, name, data: d } = item;
   const drv = await driveFor(item.company);
+  // Same purchase filed before (same date + amount + merchant, or its order confirmation): the new one replaces it.
+  const replace = true; // always keep the newest copy of a purchase (finds nothing to replace for a new one)
   for (const segs of plan.create) await ensureFolder(drv, segs);
-  // Numbered project receipts: take the sheet row first, so the file name and the row share one 编号.
+  const oldFile = replace ? await findOldFilePath(drv, plan, d).catch(() => null) : null;
+  // Numbered project receipts: take the sheet row first, so the file name and the row share one 编号
+  // (when replacing, reuse the old row and its 编号).
   let reserved = null;
-  if (plan.project?.numbered) reserved = await reserveRow(await driveFor(plan.project.company), plan.project.ledger);
-  const saved = await uploadUnique(drv, plan.folder, reserved ? `${reserved.number} ${name}` : name, item.blob);
+  if (plan.project?.numbered) {
+    const pdrv = await driveFor(plan.project.company);
+    reserved = (replace && (await existingRow(pdrv, plan.project.ledger, d))) || (await reserveRow(pdrv, plan.project.ledger));
+  }
+  const finalName = reserved?.number ? `${reserved.number} ${name}` : name;
+  let saved;
+  if (oldFile && oldFile.join("/") === [...plan.folder, finalName].join("/")) {
+    const res = await upload(drv, oldFile, item.blob, "replace"); // same name: overwrite in place
+    if (!res.ok) throw await gError(res, "覆盖旧收据");
+    saved = finalName;
+  } else {
+    saved = await uploadUnique(drv, plan.folder, finalName, item.blob);
+    if (oldFile) await deleteFile(drv, oldFile).catch(() => {});
+  }
   // Company log (JML CSV register / PU Excel ledger / none for Investment) + project sheet if tagged.
   const entries = [];
-  if (plan.register) entries.push({ company: item.company, reg: plan.register, row: L.registerRow(d, item.card, [...plan.folder.slice(1), saved].join("/"), item.sourceName) });
-  else if (plan.ledger) entries.push({ company: item.company, ledger: plan.ledger, d: { ...d } });
-  if (plan.project) entries.push({ company: plan.project.company, ledger: plan.project.ledger, d: { ...d, note: plan.project.note }, reserved });
+  if (plan.register) entries.push({ company: item.company, reg: plan.register, row: L.registerRow(d, item.card, [...plan.folder.slice(1), saved].join("/"), item.sourceName), d: { ...d }, replace });
+  else if (plan.ledger) entries.push({ company: item.company, ledger: plan.ledger, d: { ...d }, replace });
+  if (plan.project) entries.push({ company: plan.project.company, ledger: plan.project.ledger, d: { ...d, note: plan.project.note }, reserved, replace });
   let regNote = "";
   await flushPendingRows().catch(() => {});
   for (const entry of entries) {
@@ -553,7 +626,7 @@ function issueText(item) {
   const d = item.data;
   if (!item.company) return `卡号 ${d.cardLast4 ? "****" + d.cardLast4 : "没看到"}，请选公司`;
   if (!item.plan) return "日期或金额没读到";
-  if (item.dup) return "可能重复";
+
   if (!item.known) return "非公司卡 → OTHER CARD";
   return item.notes || "请看一下";
 }
@@ -617,7 +690,8 @@ function renderBatch() {
     r.title.textContent = item.saved || item.plan?.previewName || item.name ||
       (d ? [d.date, d.merchant, d.total ? `GBP ${Number(d.total).toFixed(2)}` : ""].filter(Boolean).join(" · ") : "") ||
       item.file.name || "收据";
-    r.sub.textContent = [STATUS[item.status], issueText(item)].filter(Boolean).join(" · ");
+    const dupNote = item.dup && ["ready", "check"].includes(item.status) ? `会替换旧的：${item.dupWhat}` : "";
+    r.sub.textContent = [STATUS[item.status], issueText(item), dupNote].filter(Boolean).join(" · ");
     r.x.hidden = !["ready", "check", "error"].includes(item.status);
     if (ul.children[idx] !== r.li) ul.insertBefore(r.li, ul.children[idx] || null);
   });
@@ -747,6 +821,8 @@ async function updatePlan() {
     if (item.project && $("f-property").value !== d.property) $("f-property").value = d.property;
     renderProjects(item);
     $("dup-warn").hidden = !item.dup;
+    $("dup-text").textContent =
+      `这笔已经归档过（${item.dupWhat}）—— 归档时用这张替换旧的，只留最新的（旧文件进 OneDrive 回收站）。`;
     $("confirm").disabled = false;
   } catch (e) {
     if (seq === planSeq) $("plan").textContent = e.message;

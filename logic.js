@@ -244,17 +244,35 @@ export function ledgerCells(kind, r) {
 // `values` is usedRange values (2D, starting at A1). Real dates come back as Excel serial numbers
 // (Excel Online's *text* is US-formatted, so don't compare text); dates typed as text are dd/mm/yyyy.
 // Amount column E (bank) or G (expense).
-export function ledgerHasDup(values, kind, r) {
-  const serial = excelSerial(r.date);
-  const uk = ukDate(r.date);
+// Row number (1-based) of the same receipt in a ledger/project sheet, or 0.
+// Merchant column: bank D, expense C, project G.
+// Merchant column: bank D, expense C, project G. Description: bank I, expense D, project F.
+export function findLedgerRow(values, kind, r) {
   const amountCol = kind === "expense" ? 6 : 4;
-  const total = Number(r.total).toFixed(2);
-  return values.some((row) => {
-    const d = row[1];
-    const sameDate = d === serial || (typeof d === "string" && d.trim() === uk);
-    return sameDate && Number(String(row[amountCol] ?? "").replace(/[£,]/g, "")).toFixed(2) === total;
+  const merchantCol = { bank: 3, expense: 2, project: 6 }[kind];
+  const purposeCol = { bank: 8, expense: 3, project: 5 }[kind];
+  const i = values.findIndex((row, idx) => {
+    if (idx < 3 || !row) return false;
+    const date = cellDate(row[1]);
+    if (!date) return false;
+    const total = String(row[amountCol] ?? "").replace(/[£,]/g, "");
+    if (total === "" || isNaN(Number(total))) return false;
+    return samePurchase({ date, merchant: row[merchantCol], purpose: row[purposeCol], total }, r);
   });
+  return i + 1;
 }
+
+// A sheet date: an Excel serial number, or text typed as dd/mm/yyyy.
+function cellDate(v) {
+  if (typeof v === "number" && v > 30000) {
+    const t = new Date(Date.UTC(1899, 11, 30) + v * 86400000);
+    return `${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}-${pad(t.getUTCDate())}`;
+  }
+  const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(String(v ?? "").trim());
+  return m ? `${m[3]}-${pad(m[2])}-${pad(m[1])}` : null;
+}
+
+export const ledgerHasDup = (values, kind, r) => findLedgerRow(values, kind, r) > 0;
 
 // Next free row: bank sheet = after the last row with anything in B..P (data starts at row 15);
 // Expense Claims = first row 17..51 with no date, supplier or total (EX numbers are pre-filled in I).
@@ -304,10 +322,54 @@ export function registerRow(r, card, filePath, sourceName) {
 }
 
 // Minimal CSV parse — enough to spot duplicates (date + total).
+// ----- Duplicates: same date + same amount + same merchant = the same receipt, and the new one
+// replaces the old one (file, register line or sheet row). Merchant is matched loosely
+// ("Selco" ~ "Selco Builders Warehouse"); a blank merchant on either side doesn't block a match.
+export function sameMerchant(a, b) {
+  const x = compact(a), y = compact(b);
+  if (!x || !y) return true;
+  return x.includes(y) || y.includes(x) || x.slice(0, 5) === y.slice(0, 5);
+}
+
+const csvCells = (line) => line.match(/"((?:[^"]|"")*)"/g)?.map((c) => c.slice(1, -1).replace(/""/g, '"')) || [];
+
+// Two copies of one purchase: (A) same date, or (B) the old one is an order confirmation —
+// purpose ends "(order)" — up to 60 days apart (the formal invoice comes after delivery).
+// Amount and merchant must match in both cases.
+export const ORDER_TAG = "(order)";
+const ORDER_WINDOW_DAYS = 60;
+const isOrder = (text) => String(text || "").toLowerCase().includes(ORDER_TAG);
+const daysApart = (isoA, isoB) => Math.abs(excelSerial(isoA) - excelSerial(isoB));
+export function samePurchase(old, r) {
+  if (Number(old.total).toFixed(2) !== Number(r.total).toFixed(2) || !sameMerchant(old.merchant, r.merchant)) return false;
+  if (old.date === r.date) return true;
+  return isOrder(old.purpose) && parseISO(old.date) && daysApart(old.date, r.date) <= ORDER_WINDOW_DAYS;
+}
+
+// Index (in csvText.split(/\r?\n/)) of the register line for the same purchase, or -1.
+export function findDuplicateLine(csvText, r) {
+  return csvText.split(/\r?\n/).findIndex((line, i) => {
+    if (i === 0) return false;
+    const c = csvCells(line);
+    return c[1] === r.company && samePurchase({ date: c[0], merchant: c[2], purpose: c[3], total: c[5] }, r);
+  });
+}
+
 export function findDuplicate(csvText, r) {
-  const total = Number(r.total).toFixed(2);
-  return csvText.split(/\r?\n/).slice(1).find((line) => {
-    const cells = line.match(/"((?:[^"]|"")*)"/g)?.map((c) => c.slice(1, -1)) || [];
-    return cells[0] === r.date && cells[5] === total && cells[1] === r.company;
+  const i = findDuplicateLine(csvText, r);
+  return i < 0 ? null : csvText.split(/\r?\n/)[i];
+}
+
+// File path (relative to the company root) recorded on a register line.
+export const registerLineFile = (line) => csvCells(line)[13] || null;
+
+// Old file in a folder for the same receipt, by its name: "[NNN ]YYYY MM DD CO, Merchant, …, GBP 12.34[, VAT …].ext".
+export function findOldFile(names, r) {
+  const amount = `GBP ${Number(r.total).toFixed(2)}`;
+  return names.find((n) => {
+    const body = n.replace(/^\d{3}(?:[ -]\d{2})? (?=\d{4} \d{2} \d{2} )/, ""); // drop a "010 " number prefix
+    const m = /^(\d{4}) (\d{2}) (\d{2}) [^,]*, ([^,]*),(.*)$/.exec(body);
+    if (!m || !(n.includes(`${amount}.`) || n.includes(`${amount},`))) return false;
+    return samePurchase({ date: `${m[1]}-${m[2]}-${m[3]}`, merchant: m[4], purpose: m[5], total: r.total }, r);
   }) || null;
 }
